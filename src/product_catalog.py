@@ -25,6 +25,7 @@ MAPPING_FIELDS = ("alias", "item_code", "description")
 # Excel renders long numbers such as barcodes as 9.32877E+12 once the cell is
 # too narrow, permanently losing digits. Real identifiers never look like this.
 _SCI_NOTATION = re.compile(r"^\d(?:\.\d+)?[eE]\+\d{2,}$")
+_YEAR_MONTH = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _DELIMITERS = (",", "\t", ";", "|")
 _SAMPLE_LIMIT = 8
 
@@ -527,6 +528,132 @@ class ProductCatalog:
         finally:
             conn.close()
         return {"total": total, "unnamed": unnamed}
+
+    # -- manual edits ------------------------------------------------------
+
+    def get_stock_row(self, inventory_id):
+        """One stock row with its product's details, or None if it's gone."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT i.id, i.sys_key, i.expiry_date, i.quantity, p.item_code, p.alias, "
+                "p.description, p.is_placeholder, "
+                "(SELECT COUNT(*) FROM inventory WHERE sys_key = i.sys_key) "
+                "FROM inventory i JOIN products p ON p.sys_key = i.sys_key WHERE i.id = ?",
+                (inventory_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        keys = ("id", "sys_key", "expiry", "quantity", "item_code", "alias",
+                "description", "is_placeholder", "stock_rows")
+        return dict(zip(keys, row))
+
+    def identifier_sharing(self, sys_key, item_code, alias):
+        """Other products that already use this item code or alias (so a scan of it
+        would have to ask which product is meant)."""
+        keys = sorted({k for k in (normalize_identifier(item_code), normalize_identifier(alias)) if k})
+        if not keys:
+            return []
+        marks = ",".join("?" * len(keys))
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"SELECT sys_key, item_code, alias, description, is_placeholder FROM products "
+                f"WHERE sys_key <> ? AND (code_key IN ({marks}) OR alias_key IN ({marks}))",
+                [sys_key, *keys, *keys],
+            ).fetchall()
+        finally:
+            conn.close()
+        return [self._product_dict(row) for row in rows]
+
+    def edit_stock_row(self, inventory_id, description, item_code, alias, expiry, quantity, dry_run=False):
+        """Applies a manual edit. Name, item code and alias belong to the product,
+        so they change everywhere; expiry and quantity change only this stock row.
+        Raises ValueError with a user-readable message (and changes nothing) if the
+        values are invalid or would collide with an existing product or stock row.
+        With dry_run=True it runs every check and rolls back, so a caller can validate
+        an edit (and ask for confirmation) before really applying it."""
+        description = (description or "").strip()
+        item_code = (item_code or "").strip()
+        alias = (alias or "").strip()
+        expiry = (expiry or "").strip()
+
+        if not _YEAR_MONTH.match(expiry):
+            raise ValueError("Expiry must look like YYYY-MM, for example 2027-03.")
+        try:
+            quantity = int(str(quantity).strip())
+        except ValueError:
+            raise ValueError("Quantity must be a whole number.")
+        if quantity < 1:
+            raise ValueError("Quantity must be at least 1. Use Remove selected to delete a stock row.")
+        for label, value in (("Item code", item_code), ("Alias", alias)):
+            if looks_like_scientific_notation(value):
+                raise ValueError(
+                    f"{label} looks like a number Excel has shortened (scientific notation). "
+                    "Enter the full digits."
+                )
+        code_key, alias_key = normalize_identifier(item_code), normalize_identifier(alias)
+        if not code_key and not alias_key:
+            raise ValueError("Enter an alias or an item code so the product can be identified.")
+
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT i.sys_key, i.expiry_date, p.code_key, p.alias_key, p.is_placeholder "
+                "FROM inventory i JOIN products p ON p.sys_key = i.sys_key WHERE i.id = ?",
+                (inventory_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("That stock row no longer exists. Refresh and try again.")
+            sys_key, old_expiry, old_code_key, old_alias_key, old_placeholder = row
+
+            if (code_key, alias_key) != (old_code_key, old_alias_key):
+                clash = conn.execute(
+                    "SELECT description FROM products WHERE code_key = ? AND alias_key = ? AND sys_key <> ?",
+                    (code_key, alias_key, sys_key),
+                ).fetchone()
+                if clash:
+                    raise ValueError(
+                        "Another product already has exactly this item code and alias: "
+                        f"{clash[0] or PLACEHOLDER_LABEL}. Change one of them."
+                    )
+
+            if expiry != old_expiry:
+                clash = conn.execute(
+                    "SELECT 1 FROM inventory WHERE sys_key = ? AND expiry_date = ? AND id <> ?",
+                    (sys_key, expiry, inventory_id),
+                ).fetchone()
+                if clash:
+                    raise ValueError(
+                        f"This product already has a stock row expiring {expiry}. "
+                        "Edit that row's quantity instead."
+                    )
+
+            # Giving a product a name makes it a real product, so a later import
+            # won't fold it into a different one as if it were an unnamed scan.
+            is_placeholder = 0 if description else old_placeholder
+            conn.execute(
+                "UPDATE products SET item_code = ?, alias = ?, code_key = ?, alias_key = ?, "
+                "description = ?, is_placeholder = ?, updated_at = ? WHERE sys_key = ?",
+                (item_code, alias, code_key, alias_key, description, is_placeholder, _now(), sys_key),
+            )
+            conn.execute(
+                "UPDATE inventory SET expiry_date = ?, quantity = ?, last_updated = ? WHERE id = ?",
+                (expiry, quantity, datetime.now().isoformat(), inventory_id),
+            )
+            if dry_run:
+                conn.rollback()
+                return
+            self.bump_inventory_revision(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        self.reload_index()
 
     # -- column mapping memory --------------------------------------------
 

@@ -16,11 +16,17 @@ import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore as admin_firestore
 
+import app_paths
+import secure_store
 from product_catalog import (
     ProductCatalog, PLACEHOLDER_LABEL, MAPPING_FIELDS, read_table, guess_mapping,
     validate_mapping, parse_rows, format_import_summary,
 )
 from ui_theme import ThemeManager, ThemedScrolledText, UI_FONT, make_button, system_prefers_dark
+
+# Stock expiring within this many days is highlighted as "expiring soon".
+WARNING_DAY_PRESETS = (30, 60, 90)
+DEFAULT_WARNING_DAYS = 60
 
 QR_AVAILABLE = importlib.util.find_spec("qrcode") is not None and importlib.util.find_spec("PIL") is not None
 
@@ -75,36 +81,36 @@ def validate_firebase_web_config(raw_text):
     return True, config, "Looks like a valid Firebase web config."
 
 
-def validate_service_account_file(path):
+def validate_service_account_info(data):
     """
-    Validates that a Firebase/Google Cloud service account key exists at
-    `path` and looks usable.
+    Validates the contents of a Firebase/Google Cloud service account key.
 
-    Returns a (is_valid: bool, message: str) tuple, where `message` is the
-    resolved project_id on success or a human-readable error on failure.
+    Returns (is_valid, message) where `message` is the project_id on success or
+    a human-readable error on failure.
     """
-    if not os.path.exists(path):
-        return False, (
-            "config/service_account.json was not found. In the Firebase "
-            "Console, go to Project Settings > Service Accounts > Generate "
-            "new private key, and save the downloaded file at that path."
-        )
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        return False, f"config/service_account.json is not valid JSON: {e}"
+    if not isinstance(data, dict):
+        return False, "That file isn't a Firebase service account key."
 
     missing = [key for key in REQUIRED_SERVICE_ACCOUNT_KEYS if not data.get(key)]
     if data.get("type") != "service_account" or missing:
         return False, (
-            "config/service_account.json doesn't look like a Firebase service "
-            "account key. Re-download it from Firebase Console > Project "
-            "Settings > Service Accounts > Generate new private key."
+            "That doesn't look like a Firebase service account key. In the Google Cloud console, "
+            "open IAM & Admin > Service accounts, choose the account, then Keys > Add key > JSON."
         )
-
     return True, data.get("project_id")
+
+
+def validate_service_account_file(path):
+    """Like validate_service_account_info, for a key file on disk."""
+    if not os.path.exists(path):
+        return False, "No key file was found."
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return False, f"That file is not valid JSON: {e}"
+    return validate_service_account_info(data)
+
 
 class StockTrackerApp:
     def __init__(self, root):
@@ -113,26 +119,30 @@ class StockTrackerApp:
         self.root.geometry("1040x660")
         self.root.configure(bg="#f3f4f6") # Light gray background (themed below)
         
-        # Define database path (going up one level from src/ to root, then into database/)
-        # For simplicity when running as an exe, we check the current directory or a database folder
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.db_path = os.path.join(base_dir, 'database', 'store_inventory.db')
-        
-        # Fallback to local directory if the structure isn't perfect (e.g., when run as .exe)
-        if not os.path.exists(os.path.join(base_dir, 'database')):
-            self.db_path = 'store_inventory.db'
+        # Project folder when run from source, %LOCALAPPDATA%\\StockTracker when installed
+        self.db_path = app_paths.database_path()
 
         self.connection_status_var = tk.StringVar(value="◌ Checking mobile...")
         self.connection_poll_job = None
         self.db = None
         self.status_pill = None
         self.theme_button = None
+        self.legend_soon_label = None
+        self.row_menu = None
+        self.catalog_refresh = None
+        self.expiry_warning_days = DEFAULT_WARNING_DAYS
 
         # init_db() must run first — it creates the settings table that
         # load_or_create_connection_token() reads from and writes to.
         self.init_db()
         saved_theme = self.get_setting("ui_theme")
         self.theme = ThemeManager(self.root, saved_theme or ("dark" if system_prefers_dark() else "light"))
+        self.expiry_warning_days = self.load_warning_days()
+        self.credentials_info = None
+        self.credentials_source = None
+        self.credentials_error = None
+        self.credentials_listeners = []
+        self.reload_credentials()
         # Needs the inventory table from init_db(); re-keys stock by product.
         self.catalog = ProductCatalog(self.db_path)
         self.catalog_window = None
@@ -154,6 +164,8 @@ class StockTrackerApp:
             self.start_connection_polling()
         else:
             self.root.withdraw()
+
+        self.root.after(600, self.offer_credential_migration)
 
     def init_db(self):
         """Ensures the database and required tables exist before launching the UI."""
@@ -204,6 +216,28 @@ class StockTrackerApp:
         except Exception:
             pass
 
+    def load_warning_days(self):
+        """Saved expiring-soon window in days (falls back to the default)."""
+        try:
+            days = int(self.get_setting("expiry_warning_days") or DEFAULT_WARNING_DAYS)
+            return days if days > 0 else DEFAULT_WARNING_DAYS
+        except ValueError:
+            return DEFAULT_WARNING_DAYS
+
+    def warning_day_choices(self):
+        """Dropdown labels: the presets, plus the current value if it isn't one of them."""
+        days = sorted(set(WARNING_DAY_PRESETS) | {self.expiry_warning_days})
+        return [f"{d} days" for d in days]
+
+    def set_warning_days(self, days, refresh=True):
+        """Saves the expiring-soon window and updates the legend and table colours."""
+        self.expiry_warning_days = days
+        self.save_setting("expiry_warning_days", str(days))
+        if self.legend_soon_label is not None:
+            self.legend_soon_label.config(text=f"■  Expiring within {days} days")
+        if refresh and getattr(self, "tree", None) is not None:
+            self.refresh_data(run_sync=False)
+
     def toggle_theme(self):
         """Switches between light and dark mode and remembers the choice."""
         mode = self.theme.toggle()
@@ -215,35 +249,200 @@ class StockTrackerApp:
             self.theme_button.config(text="☀  Light mode" if self.theme.mode == "dark" else "☾  Dark mode")
 
     def get_service_account_path(self):
-        """Fixed on-disk location of the Firebase Admin SDK service account key."""
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(base_dir, 'config', 'service_account.json')
+        """Legacy plain-text key location. Only read so an existing key can be migrated
+        into encrypted storage; new keys are never written here."""
+        return os.path.join(app_paths.config_dir(), 'service_account.json')
+
+    def credentials_store_path(self):
+        """Where the encrypted key lives (Windows-user-bound, unreadable as text)."""
+        return os.path.join(app_paths.config_dir(), 'firebase_credentials.dat')
+
+    def reload_credentials(self):
+        """Loads the service account key into memory: encrypted store first, then the
+        legacy plain file. The key is never written back out or shown."""
+        self.credentials_info, self.credentials_source, self.credentials_error = None, None, None
+        try:
+            stored = secure_store.load_service_account(self.credentials_store_path())
+        except secure_store.SecureStoreError as e:
+            stored = None
+            self.credentials_error = str(e)
+
+        if stored:
+            valid, _ = validate_service_account_info(stored)
+            if valid:
+                self.credentials_info, self.credentials_source = stored, "secure"
+                return
+
+        legacy_valid, _ = validate_service_account_file(self.get_service_account_path())
+        if legacy_valid:
+            with open(self.get_service_account_path(), "r", encoding="utf-8") as f:
+                self.credentials_info, self.credentials_source = json.load(f), "legacy"
+
+    def credentials_summary(self):
+        """One-line, non-secret description of the stored credentials for the UI."""
+        info = self.credentials_info
+        if info is None:
+            return self.credentials_error or "No key stored yet. Choose the key file you downloaded from Firebase."
+        who = f"project {info.get('project_id')}, account {info.get('client_email')}"
+        if self.credentials_source == "legacy":
+            return f"Found an UNPROTECTED key file for {who}. You'll be offered to encrypt it."
+        return f"Stored encrypted for {who}. The key itself is never shown."
+
+    def notify_credentials_changed(self):
+        for listener in list(self.credentials_listeners):
+            try:
+                listener()
+            except tk.TclError:
+                self.credentials_listeners.remove(listener)  # its window has been closed
 
     def has_firebase_setup(self):
         """Checks whether both halves of the Firebase setup are in place: a
-        saved web config (embedded in the mobile pairing QR) and a valid
-        service account key on disk (for this app's own Admin SDK access)."""
-        is_valid, _ = validate_service_account_file(self.get_service_account_path())
-        return is_valid and bool(self.get_saved_firebase_web_config())
+        saved web config (embedded in the mobile pairing QR) and a service
+        account key (for this app's own Admin SDK access)."""
+        return self.credentials_info is not None and bool(self.get_saved_firebase_web_config())
 
-    def connect_firestore(self):
-        """Initializes the Firebase Admin SDK connection from the service
-        account key on disk. Safe to call more than once — firebase_admin
-        only allows one default app per process."""
-        is_valid, message = validate_service_account_file(self.get_service_account_path())
-        if not is_valid:
+    def connect_firestore(self, info=None, verify=False):
+        """Initializes the Firebase Admin SDK connection from the in-memory key (or a
+        candidate `info` being tested). With verify=True it also performs a real read,
+        which proves the key works and has Firestore access."""
+        info = info or self.credentials_info
+        if not info:
             self.db = None
-            return False, message
+            return False, self.credentials_error or "No Firebase credentials are stored yet."
 
         try:
-            if not firebase_admin._apps:
-                cred = credentials.Certificate(self.get_service_account_path())
-                firebase_admin.initialize_app(cred)
-            self.db = admin_firestore.client()
+            try:
+                firebase_admin.delete_app(firebase_admin.get_app())
+            except ValueError:
+                pass  # no default app yet
+            firebase_admin.initialize_app(credentials.Certificate(info))
+            db = admin_firestore.client()
+            if verify:
+                db.collection("presence").limit(1).get()
+            self.db = db
             return True, "Connected."
         except Exception as e:
             self.db = None
-            return False, f"Could not initialize the Firebase Admin SDK: {e}"
+            return False, f"Could not connect to Firebase: {e}"
+
+    def delete_plaintext_key(self, path):
+        """Overwrites and deletes a plain key file. Returns an error message or None."""
+        try:
+            secure_store.secure_delete(path)
+            return None
+        except OSError as e:
+            return f"Couldn't delete {path}: {e}. Delete it yourself."
+
+    def import_credentials_flow(self, parent, on_done=None):
+        """The only way to add or replace the Firebase key. Picks a key file, validates it,
+        tests it against Firestore, asks for confirmation, then stores it encrypted and
+        offers to delete the file. The key itself is never displayed."""
+        path = filedialog.askopenfilename(
+            parent=parent,
+            title="Choose your Firebase service account key",
+            filetypes=[("JSON key file", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return False
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Firebase key", f"Could not read that file as a key: {e}", parent=parent)
+            return False
+        valid, message = validate_service_account_info(data)
+        if not valid:
+            messagebox.showwarning("Firebase key", message, parent=parent)
+            return False
+
+        lines = []
+        previous = self.credentials_info
+        if previous:
+            lines += ["This REPLACES the stored Firebase credentials.",
+                      f"   Now: {previous.get('project_id')} / {previous.get('client_email')}",
+                      f"   New: {data['project_id']} / {data['client_email']}"]
+        else:
+            lines += [f"Project: {data['project_id']}", f"Service account: {data['client_email']}"]
+
+        web_config = self.get_saved_firebase_web_config()
+        if web_config and web_config.get("projectId") != data["project_id"]:
+            lines += ["", f"WARNING: the saved web config is for project '{web_config.get('projectId')}', "
+                          "but this key is for a different project. The phone and this PC would use different databases."]
+        lines += ["", "The key will be tested, then encrypted for this Windows account. "
+                      "The app never shows it again.", "", "Continue?"]
+        if not messagebox.askyesno("Store this Firebase key?", "\n".join(lines), parent=parent):
+            return False
+
+        connected, error = self.connect_firestore(info=data, verify=True)
+        if not connected:
+            self.connect_firestore()  # go back to the previous credentials, if any
+            messagebox.showerror("Firebase key", f"{error}\n\nNothing was changed.", parent=parent)
+            return False
+
+        try:
+            secure_store.save_service_account(self.credentials_store_path(), data)
+        except secure_store.SecureStoreError as e:
+            self.connect_firestore()
+            messagebox.showerror("Firebase key", f"{e}\n\nNothing was changed.", parent=parent)
+            return False
+        self.reload_credentials()
+        self.connect_firestore()
+        self.notify_credentials_changed()
+
+        # Plain-text copies are the main leak risk, so offer to remove every one.
+        copies = [path]
+        legacy = self.get_service_account_path()
+        if os.path.exists(legacy) and os.path.abspath(legacy) != os.path.abspath(path):
+            copies.append(legacy)
+        if messagebox.askyesno(
+            "Delete the key file?",
+            "The key is now stored encrypted. Delete the plain-text file(s)?\n\n   " + "\n   ".join(copies)
+            + "\n\nRecommended: a leftover copy can be opened by anyone using this PC.",
+            parent=parent,
+        ):
+            problems = [m for m in (self.delete_plaintext_key(p) for p in copies if os.path.exists(p)) if m]
+            if problems:
+                messagebox.showwarning("Delete the key file", "\n".join(problems), parent=parent)
+
+        messagebox.showinfo(
+            "Firebase key stored",
+            "The key is stored encrypted.\n\nIf an older key was ever left on disk, in Downloads, or "
+            "shared, also delete that key in the Firebase console (Project settings > Service accounts).",
+            parent=parent,
+        )
+        if on_done:
+            on_done()
+        return True
+
+    def offer_credential_migration(self):
+        """If the key is still a plain config/service_account.json, offer to encrypt and remove it."""
+        if self.credentials_source != "legacy":
+            return
+        info = self.credentials_info
+        legacy = self.get_service_account_path()
+        if not messagebox.askyesno(
+            "Protect your Firebase key",
+            "Your Firebase key is a plain file that anyone using this PC can open:\n\n"
+            f"   {legacy}\n\nProject: {info.get('project_id')}\nAccount: {info.get('client_email')}\n\n"
+            "Encrypt it for this Windows account and delete the plain file now?",
+        ):
+            return
+        try:
+            secure_store.save_service_account(self.credentials_store_path(), info)
+        except secure_store.SecureStoreError as e:
+            messagebox.showerror("Protect your Firebase key", f"{e}\n\nNothing was changed.")
+            return
+
+        problem = self.delete_plaintext_key(legacy)
+        self.reload_credentials()
+        self.notify_credentials_changed()
+        messagebox.showinfo(
+            "Firebase key protected",
+            "The key is now stored encrypted." + (f"\n\n{problem}" if problem else "")
+            + "\n\nBecause the plain file existed for a while, consider replacing the key in the "
+              "Firebase console and importing the new one from Settings.",
+        )
 
     def save_firebase_web_config(self, config):
         """Stores the Firebase web config (a dict) for later use."""
@@ -436,7 +635,10 @@ class StockTrackerApp:
             self.setup_completed = False
             messagebox.showinfo("Reset Complete", "The app has been reset to its default state. Restarting setup now.")
             self.root.destroy()
-            os.execl(sys.executable, sys.executable, *sys.argv)
+            if app_paths.is_frozen():
+                os.execl(sys.executable, sys.executable)
+            else:
+                os.execl(sys.executable, sys.executable, *sys.argv)
         except Exception as e:
             messagebox.showerror("Reset Failed", f"Could not reset the app: {e}")
 
@@ -519,7 +721,7 @@ class StockTrackerApp:
             intro_frame,
             text=(
                 "1. A Firebase project with Firestore enabled.\n"
-                "2. A service account key saved as config/service_account.json.\n"
+                "2. A Firebase service account key file (you choose it below; it is then stored encrypted).\n"
                 "3. The Firebase web app config, pasted below."
             ),
             font=(UI_FONT, 9),
@@ -548,22 +750,22 @@ class StockTrackerApp:
 
         add_step(guide_frame, 1, "Create a Firebase project", "console.firebase.google.com > Add project. The free Spark plan is enough for this app.")
         add_step(guide_frame, 2, "Enable Firestore", "Build > Firestore Database > Create database.")
-        add_step(guide_frame, 3, "Download a service account key", "Project Settings > Service Accounts > Generate new private key. Save the downloaded file as config/service_account.json next to this app.")
+        add_step(guide_frame, 3, "Download a service account key", "Google Cloud console > IAM & Admin > Service accounts > Keys > Add key > JSON. Save it anywhere; you choose it below and the app stores it encrypted and can delete the file.")
         add_step(guide_frame, 4, "Register a web app", "Project Settings > General > Your apps > Add app > Web. Copy the shown firebaseConfig object and paste it below.")
 
         sa_frame = tk.Frame(container, bg="white")
         sa_frame.pack(fill=tk.X, pady=(18, 0))
 
-        tk.Label(sa_frame, text="Service Account Key", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w")
-        sa_status_text = tk.StringVar(value="Not checked yet.")
+        tk.Label(sa_frame, text="Firebase Service Account Key", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w")
+        sa_status_text = tk.StringVar()
         tk.Label(sa_frame, textvariable=sa_status_text, font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=480, justify=tk.LEFT).pack(anchor="w", pady=(2, 8))
 
-        def check_service_account():
-            is_valid, message = validate_service_account_file(self.get_service_account_path())
-            sa_status_text.set(f"Found. Project ID: {message}" if is_valid else message)
+        def refresh_key_status():
+            sa_status_text.set(self.credentials_summary())
 
-        tk.Button(sa_frame, text="Check service_account.json", command=check_service_account, bg="#10b981", fg="white", relief=tk.FLAT, padx=14, pady=8).pack(anchor="w")
-        check_service_account()
+        tk.Button(sa_frame, text="Choose key file...", command=lambda: self.import_credentials_flow(setup_window, refresh_key_status), bg="#10b981", fg="white", relief=tk.FLAT, padx=14, pady=8).pack(anchor="w")
+        refresh_key_status()
+        self.credentials_listeners.append(refresh_key_status)
 
         form_frame = tk.Frame(container, bg="white")
         form_frame.pack(fill=tk.X, pady=(18, 0))
@@ -573,6 +775,14 @@ class StockTrackerApp:
 
         config_entry = ThemedScrolledText(form_frame, height=8, wrap=tk.WORD, font=("Consolas", 9), bg="white", fg="#111827", relief=tk.SOLID, bd=1)
         config_entry.pack(fill=tk.X)
+
+        prefs_frame = tk.Frame(container, bg="white")
+        prefs_frame.pack(fill=tk.X, pady=(18, 0))
+        tk.Label(prefs_frame, text="Expiring-soon warning", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w")
+        tk.Label(prefs_frame, text="Stock expiring within this window is highlighted yellow. You can change this later from Settings.", font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=480, justify=tk.LEFT).pack(anchor="w", pady=(2, 8))
+        warning_combo = ttk.Combobox(prefs_frame, state="readonly", width=14, values=self.warning_day_choices())
+        warning_combo.set(f"{self.expiry_warning_days} days")
+        warning_combo.pack(anchor="w")
 
         tip_text = tk.StringVar(value="Paste your Firebase web config above.")
         tk.Label(container, textvariable=tip_text, font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=480, justify=tk.LEFT).pack(anchor="w", pady=(10, 0))
@@ -588,10 +798,10 @@ class StockTrackerApp:
         button_row.pack(fill=tk.X)
 
         def continue_setup():
-            sa_valid, sa_message = validate_service_account_file(self.get_service_account_path())
-            if not sa_valid:
-                tip_text.set(sa_message)
-                messagebox.showwarning("Service Account Missing", sa_message)
+            if self.credentials_info is None:
+                message = self.credentials_error or "Choose your Firebase key file first."
+                tip_text.set(message)
+                messagebox.showwarning("Firebase Key Missing", message)
                 return
 
             is_valid, config, message = validate_firebase_web_config(config_entry.get("1.0", tk.END))
@@ -601,7 +811,8 @@ class StockTrackerApp:
                 return
 
             self.save_firebase_web_config(config)
-            connected, connect_message = self.connect_firestore()
+            self.set_warning_days(int(warning_combo.get().split()[0]), refresh=False)
+            connected, connect_message = self.connect_firestore(verify=True)
             if not connected:
                 messagebox.showwarning("Connection Failed", connect_message)
                 return
@@ -619,10 +830,10 @@ class StockTrackerApp:
             )
 
         def test_connection():
-            sa_valid, sa_message = validate_service_account_file(self.get_service_account_path())
-            if not sa_valid:
-                tip_text.set(sa_message)
-                messagebox.showwarning("Service Account Missing", sa_message)
+            if self.credentials_info is None:
+                message = self.credentials_error or "Choose your Firebase key file first."
+                tip_text.set(message)
+                messagebox.showwarning("Firebase Key Missing", message)
                 return
 
             is_valid, config, message = validate_firebase_web_config(config_entry.get("1.0", tk.END))
@@ -631,7 +842,7 @@ class StockTrackerApp:
                 messagebox.showwarning("Invalid Config", message)
                 return
 
-            connected, connect_message = self.connect_firestore()
+            connected, connect_message = self.connect_firestore(verify=True)
             tip_text.set(connect_message)
             if connected:
                 messagebox.showinfo("Connection OK", connect_message)
@@ -729,6 +940,7 @@ class StockTrackerApp:
         self.pending_button.pack(side=tk.LEFT)
 
         make_button(toolbar, "🛠  Dev Tools", self.open_developer_tools, "neutral").pack(side=tk.RIGHT, padx=(10, 0))
+        make_button(toolbar, "⚙  Settings", self.open_settings_window, "neutral").pack(side=tk.RIGHT, padx=(10, 0))
         make_button(toolbar, "📱  Connect Mobile", self.show_mobile_setup, "neutral").pack(side=tk.RIGHT, padx=(10, 0))
         make_button(toolbar, "🗑  Remove Selected", self.delete_selected, "danger").pack(side=tk.RIGHT, padx=(10, 0))
         make_button(toolbar, "↻  Refresh", self.refresh_data, "success").pack(side=tk.RIGHT)
@@ -738,7 +950,9 @@ class StockTrackerApp:
         legend_frame.pack(fill=tk.X, side=tk.BOTTOM)
         tk.Label(legend_frame, text="Legend", font=(UI_FONT, 9, "bold"), bg="#f3f4f6", fg="#6b7280").pack(side=tk.LEFT, padx=(0, 14))
         tk.Label(legend_frame, text="■  Expired", fg="#ef4444", font=(UI_FONT, 10, "bold"), bg="#f3f4f6").pack(side=tk.LEFT, padx=(0, 16))
-        tk.Label(legend_frame, text="■  Expiring within 60 days", fg="#eab308", font=(UI_FONT, 10, "bold"), bg="#f3f4f6").pack(side=tk.LEFT)
+        self.legend_soon_label = tk.Label(legend_frame, text=f"■  Expiring within {self.expiry_warning_days} days",
+                                          fg="#eab308", font=(UI_FONT, 10, "bold"), bg="#f3f4f6")
+        self.legend_soon_label.pack(side=tk.LEFT)
 
         # Inventory table, in a bordered card
         card = tk.Frame(self.root, bg="#ffffff", relief=tk.SOLID, bd=1)
@@ -763,6 +977,13 @@ class StockTrackerApp:
         ):
             self.tree.heading(column, text=title, anchor=anchor)
             self.tree.column(column, width=width, anchor=anchor)
+
+        # Right-click menu: edit a single row, or remove any number of rows
+        self.row_menu = tk.Menu(self.root, tearoff=0, bg="#ffffff", fg="#111827", font=(UI_FONT, 10), relief=tk.FLAT, bd=1)
+        self.row_menu.add_command(label="✎  Edit information...", command=self.edit_selected)
+        self.row_menu.add_separator()
+        self.row_menu.add_command(label="🗑  Remove selected", command=self.delete_selected)
+        self.tree.bind("<Button-3>", self.show_row_menu)
 
         # Row colours for expired / expiring / good stock follow the theme
         self.theme.register_row_tags(self.tree)
@@ -815,7 +1036,7 @@ class StockTrackerApp:
                     if days_until_expiry < 0:
                         status = "EXPIRED"
                         tag = "expired"
-                    elif days_until_expiry < 60:  # 60 days warning window
+                    elif days_until_expiry < self.expiry_warning_days:
                         status = "Expiring Soon"
                         tag = "expiring_soon"
                 except ValueError:
@@ -963,6 +1184,7 @@ class StockTrackerApp:
 
         search_var.trace_add("write", refresh)
         refresh()
+        self.catalog_refresh = refresh
         self.theme.style(win)
 
     def open_import_dialog(self, path, on_done):
@@ -1204,6 +1426,185 @@ class StockTrackerApp:
         refresh()
         self.theme.style(win)
 
+    def show_row_menu(self, event):
+        """Right-click menu for the stock table."""
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+        if row_id not in self.tree.selection():
+            self.tree.selection_set(row_id)
+
+        count = len(self.tree.selection())
+        # Editing needs exactly one row; removing works on any number.
+        self.row_menu.entryconfigure(0, state=tk.NORMAL if count == 1 else tk.DISABLED)
+        self.row_menu.entryconfigure(2, label="🗑  Remove selected" if count == 1 else f"🗑  Remove selected ({count})")
+        try:
+            self.row_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.row_menu.grab_release()
+
+    def edit_selected(self):
+        selection = self.tree.selection()
+        if len(selection) != 1:
+            return
+        self.open_edit_dialog(int(self.tree.item(selection[0], "values")[0]))
+
+    def open_edit_dialog(self, inventory_id):
+        """Edits one stock row. Name, alias and item code belong to the product and
+        change everywhere; expiry and quantity change only this row. The changes are
+        validated, shown for confirmation, and only then applied."""
+        info = self.catalog.get_stock_row(inventory_id)
+        if info is None:
+            messagebox.showwarning("Edit information", "That item no longer exists. The table will be refreshed.")
+            self.refresh_data(run_sync=False)
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Edit Information")
+        dlg.geometry("560x640")
+        dlg.configure(bg="white")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        footer = tk.Frame(dlg, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        body = tk.Frame(dlg, bg="white", padx=24, pady=20)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(body, text="Edit information", font=(UI_FONT, 14, "bold"), bg="white", fg="#111827").pack(anchor="w")
+        tk.Label(body, text=info["description"] or PLACEHOLDER_LABEL, font=(UI_FONT, 9), bg="white", fg="#6b7280").pack(anchor="w", pady=(2, 14))
+
+        variables = {}
+
+        def section(title, note):
+            frame = tk.Frame(body, bg="#f9fafb", relief=tk.SOLID, bd=1, padx=16, pady=14)
+            frame.pack(fill=tk.X, pady=(0, 14))
+            tk.Label(frame, text=title, font=(UI_FONT, 10, "bold"), bg="#f9fafb", fg="#111827").pack(anchor="w")
+            tk.Label(frame, text=note, font=(UI_FONT, 9), bg="#f9fafb", fg="#6b7280", wraplength=460, justify=tk.LEFT).pack(anchor="w", pady=(2, 8))
+            return frame
+
+        def field(parent, key, label, value):
+            row = tk.Frame(parent, bg="#f9fafb")
+            row.pack(fill=tk.X, pady=3)
+            tk.Label(row, text=label, width=13, anchor="w", font=(UI_FONT, 9, "bold"), bg="#f9fafb", fg="#374151").pack(side=tk.LEFT)
+            variables[key] = tk.StringVar(value=str(value))
+            entry = tk.Entry(row, textvariable=variables[key], relief=tk.SOLID, bd=1, font=(UI_FONT, 10))
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+            return entry
+
+        stock_rows = info["stock_rows"]
+        plural = "s" if stock_rows != 1 else ""
+        product_box = section("Product", f"Changes apply to this product everywhere ({stock_rows} stock row{plural}).")
+        first_entry = field(product_box, "description", "Name", info["description"])
+        field(product_box, "alias", "Alias / barcode", info["alias"])
+        field(product_box, "item_code", "Item code", info["item_code"])
+
+        row_box = section("This stock row", "Changes apply to this row only. Expiry is written YYYY-MM, for example 2027-03.")
+        field(row_box, "expiry", "Expiry", info["expiry"])
+        field(row_box, "quantity", "Quantity", info["quantity"])
+
+        labels = (("description", "Name"), ("alias", "Alias"), ("item_code", "Item code"),
+                  ("expiry", "Expiry"), ("quantity", "Quantity"))
+        original = {"description": info["description"], "alias": info["alias"], "item_code": info["item_code"],
+                    "expiry": info["expiry"], "quantity": str(info["quantity"])}
+
+        def save(_event=None):
+            new = {key: var.get().strip() for key, var in variables.items()}
+            changes = [(key, label, original[key], new[key]) for key, label in labels if new[key] != original[key]]
+            if not changes:
+                dlg.destroy()
+                return
+
+            arguments = (inventory_id, new["description"], new["item_code"], new["alias"], new["expiry"], new["quantity"])
+            try:
+                self.catalog.edit_stock_row(*arguments, dry_run=True)  # same checks as the real edit, nothing saved
+            except ValueError as e:
+                messagebox.showwarning("Can't apply this edit", str(e), parent=dlg)
+                return
+
+            def describe(keys, heading):
+                picked = [c for c in changes if c[0] in keys]
+                if not picked:
+                    return []
+                return [heading] + [
+                    f"   {label}: {old or '(blank)'}  ->  {new_value or '(blank)'}"
+                    for _key, label, old, new_value in picked
+                ]
+
+            lines = describe(("description", "alias", "item_code"), f"Product (everywhere, {stock_rows} stock row{plural}):")
+            row_lines = describe(("expiry", "quantity"), "This stock row only:")
+            if lines and row_lines:
+                lines.append("")
+            lines += row_lines
+
+            if any(c[0] in ("alias", "item_code") for c in changes):
+                others = self.catalog.identifier_sharing(info["sys_key"], new["item_code"], new["alias"])
+                if others:
+                    names = ", ".join(p["description"] or PLACEHOLDER_LABEL for p in others[:3])
+                    lines += ["", f"Note: this item code/alias is also used by {names}. "
+                                  "Scanning it will ask you to choose between the products."]
+
+            if not messagebox.askyesno("Confirm changes", "\n".join(lines) + "\n\nApply these changes?", parent=dlg):
+                return
+            try:
+                self.catalog.edit_stock_row(*arguments)
+            except ValueError as e:
+                messagebox.showwarning("Can't apply this edit", str(e), parent=dlg)
+                return
+
+            dlg.destroy()
+            self.refresh_data(run_sync=False)
+            for item in self.tree.get_children():
+                if int(self.tree.item(item, "values")[0]) == inventory_id:
+                    self.tree.selection_set(item)
+                    self.tree.see(item)
+                    break
+            if self.catalog_window is not None and self.catalog_window.winfo_exists():
+                self.catalog_refresh()
+
+        make_button(footer, "Save changes", save, "primary").pack(side=tk.RIGHT)
+        make_button(footer, "Cancel", dlg.destroy, "neutral").pack(side=tk.RIGHT, padx=(0, 10))
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.bind("<Return>", save)
+
+        self.theme.style(dlg)
+        first_entry.focus_set()
+
+    def open_settings_window(self):
+        """Preferences that can be changed after first-run setup."""
+        win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.geometry("480x500")
+        win.configure(bg="white")
+        win.transient(self.root)
+
+        footer = tk.Frame(win, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        body = tk.Frame(win, bg="white", padx=24, pady=20)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(body, text="Settings", font=(UI_FONT, 14, "bold"), bg="white", fg="#111827").pack(anchor="w")
+        tk.Label(body, text="Expiring-soon warning", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(16, 0))
+        tk.Label(body, text="Stock expiring within this window is highlighted yellow in the table.", font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 8))
+        combo = ttk.Combobox(body, state="readonly", width=14, values=self.warning_day_choices())
+        combo.set(f"{self.expiry_warning_days} days")
+        combo.pack(anchor="w")
+
+        tk.Label(body, text="Firebase credentials", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(20, 0))
+        key_status = tk.StringVar(value=self.credentials_summary())
+        tk.Label(body, textvariable=key_status, font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=420, justify=tk.LEFT).pack(anchor="w", pady=(2, 8))
+        make_button(body, "Replace key file...", lambda: self.import_credentials_flow(win, lambda: key_status.set(self.credentials_summary())), "neutral").pack(anchor="w")
+
+        def save():
+            self.set_warning_days(int(combo.get().split()[0]))
+            win.destroy()
+
+        tk.Label(body, text=f"Stock Tracker version {app_paths.APP_VERSION}", font=(UI_FONT, 9), bg="white", fg="#6b7280").pack(anchor="w", pady=(24, 0))
+
+        make_button(footer, "Save", save, "primary").pack(side=tk.RIGHT)
+        make_button(footer, "Cancel", win.destroy, "neutral").pack(side=tk.RIGHT, padx=(0, 10))
+        self.theme.style(win)
+
     def show_mobile_setup(self):
         """Displays a QR code for the mobile app to scan, establishing the Firestore connection."""
         web_config = self.get_saved_firebase_web_config()
@@ -1342,12 +1743,101 @@ class StockTrackerApp:
         self.theme.style(qr_window)
 
 
+def log_exception(exc_type, exc, tb):
+    """Appends an unexpected error to error.log (a windowed .exe has no console to show it)."""
+    import datetime
+    import traceback
+    try:
+        with open(app_paths.log_path(), "a", encoding="utf-8") as log:
+            log.write(f"\n[{datetime.datetime.now().isoformat(timespec='seconds')}] v{app_paths.APP_VERSION}\n")
+            log.write("".join(traceback.format_exception(exc_type, exc, tb)))
+    except OSError:
+        pass
+
+
+def run_selftest(report_path):
+    """Checks that a packaged build contains everything the app imports at runtime.
+    Used by the build script; writes the result to `report_path`. Returns an exit code."""
+    problems = []
+
+    def step(name, check):
+        try:
+            check()
+        except Exception as e:  # any failure means the build is incomplete
+            problems.append(f"{name}: {e!r}")
+
+    def gui():
+        window = tk.Tk()
+        window.destroy()
+
+    def qr_libs():
+        import qrcode
+        from PIL import Image, ImageTk
+        qrcode.QRCode().add_data("x")
+
+    def dpapi():
+        assert secure_store.unprotect(secure_store.protect(b"probe")) == b"probe"
+
+    def catalog():
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            db = os.path.join(folder, "t.db")
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, barcode TEXT NOT NULL, "
+                         "expiry_date TEXT NOT NULL, quantity INTEGER NOT NULL, last_updated TIMESTAMP)")
+            conn.commit()
+            conn.close()
+            assert ProductCatalog(db).stats()["total"] == 0
+
+    def firebase():
+        import grpc  # noqa: F401
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+        info = {"type": "service_account", "project_id": "selftest", "client_email": "t@selftest.iam.gserviceaccount.com",
+                "private_key": pem, "token_uri": "https://oauth2.googleapis.com/token"}
+        app = firebase_admin.initialize_app(credentials.Certificate(info), name="selftest")
+        try:
+            admin_firestore.client(app)
+        finally:
+            firebase_admin.delete_app(app)
+
+    step("tkinter window", gui)
+    step("qrcode + Pillow", qr_libs)
+    step("Windows key protection", dpapi)
+    step("product catalog + sqlite", catalog)
+    step("Firebase Admin SDK + Firestore client", firebase)
+
+    with open(report_path, "w", encoding="utf-8") as report:
+        report.write("OK\n" if not problems else "FAILED\n" + "\n".join(problems) + "\n")
+    return 1 if problems else 0
+
+
 if __name__ == "__main__":
-    # Create the main window and start the application loop
+    if "--selftest" in sys.argv:
+        sys.exit(run_selftest(sys.argv[sys.argv.index("--selftest") + 1]))
+
+    sys.excepthook = log_exception
     root = tk.Tk()
-    app = StockTrackerApp(root)
-    
-    # Optional: Set window icon (if you have an .ico file, uncomment line below)
-    # root.iconbitmap('icon.ico')
-    
-    root.mainloop()
+    try:
+        root.iconbitmap(default=app_paths.resource_path("app.ico"))
+    except tk.TclError:
+        pass  # missing icon file: keep the default one
+
+    def report_callback_exception(exc_type, exc, tb):
+        log_exception(exc_type, exc, tb)
+        messagebox.showerror(
+            "Something went wrong",
+            f"{exc}\n\nDetails were saved to:\n{app_paths.log_path()}",
+        )
+
+    root.report_callback_exception = report_callback_exception
+
+    try:
+        app = StockTrackerApp(root)
+        root.mainloop()
+    except Exception:
+        log_exception(*sys.exc_info())
+        messagebox.showerror("Stock Tracker could not start", f"Details were saved to:\n{app_paths.log_path()}")
+        raise

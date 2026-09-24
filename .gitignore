@@ -1,6 +1,9 @@
 # --- Secrets: never commit these ---
 # Firebase Admin SDK key (full access to your Firestore)
 config/service_account.json
+# Encrypted credentials store (unreadable elsewhere, but still not for version control)
+config/*.dat
+config/*.dat.tmp
 *-firebase-adminsdk-*.json
 service_account*.json
 
@@ -20,7 +23,8 @@ __pycache__/
 venv/
 build/
 dist/
-*.spec
+installer/Output/
+installer/app.ico
 
 # --- Firebase CLI ---
 .firebase/

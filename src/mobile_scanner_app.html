@@ -177,7 +177,7 @@
         const disconnectBtn = document.getElementById('disconnect-btn');
 
         // Firebase web config + pairing token, delivered via the desktop app's
-        // setup QR code (see build_pairing_payload in stock_tracker_desktop_app.py).
+        // setup QR code (see build_pairing_payload in pc_backend_automation_service.py).
         // A Firebase web config's apiKey is not a secret — access is enforced by
         // Firestore Security Rules, not by hiding this object.
         let FIREBASE_CONFIG = JSON.parse(localStorage.getItem('FIREBASE_CONFIG') || 'null');

@@ -57,6 +57,7 @@ _OPTIONS = {
     "Tk": ("bg",), "Toplevel": ("bg",), "Frame": ("bg",), "Canvas": ("bg",),
     "Label": ("bg", "fg"), "Button": ("bg", "fg"),
     "Entry": ("bg", "fg", "insertbackground"), "Text": ("bg", "fg", "insertbackground"),
+    "Menu": ("bg", "fg"),
 }
 _FG_LIKE = ("fg", "insertbackground")
 
@@ -267,6 +268,10 @@ class ThemeManager:
             settings["activeforeground"] = settings.get("fg", p["text"])
             settings["disabledforeground"] = p["disabled_fg"]
             settings["cursor"] = "hand2"
+        if cls == "Menu":
+            settings["activebackground"] = ACCENT
+            settings["activeforeground"] = "white"
+            settings["disabledforeground"] = p["disabled_fg"]
         if widget._solid_border:
             settings["highlightbackground"] = p["border"]
             settings["highlightcolor"] = ACCENT if cls in ("Entry", "Text") else p["border"]
