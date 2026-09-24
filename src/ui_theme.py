@@ -58,6 +58,7 @@ _OPTIONS = {
     "Label": ("bg", "fg"), "Button": ("bg", "fg"),
     "Entry": ("bg", "fg", "insertbackground"), "Text": ("bg", "fg", "insertbackground"),
     "Menu": ("bg", "fg"),
+    "Checkbutton": ("bg", "fg"), "Radiobutton": ("bg", "fg"),
 }
 _FG_LIKE = ("fg", "insertbackground")
 
@@ -266,6 +267,12 @@ class ThemeManager:
         if cls == "Button":
             settings["activebackground"] = _shade(widget, settings.get("bg", p["surface"]), self.mode)
             settings["activeforeground"] = settings.get("fg", p["text"])
+            settings["disabledforeground"] = p["disabled_fg"]
+            settings["cursor"] = "hand2"
+        if cls in ("Checkbutton", "Radiobutton"):
+            settings["activebackground"] = settings.get("bg", p["surface"])
+            settings["activeforeground"] = settings.get("fg", p["text"])
+            settings["selectcolor"] = p["input"]          # the tick box's own background
             settings["disabledforeground"] = p["disabled_fg"]
             settings["cursor"] = "hand2"
         if cls == "Menu":

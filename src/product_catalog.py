@@ -19,7 +19,20 @@ import re
 import sqlite3
 from datetime import datetime
 
+import stock_history
+
 PLACEHOLDER_LABEL = "(unnamed product)"
+
+# Bump when the database layout changes. An older app refuses to open a newer database
+# instead of silently misreading it (which is what an accidental downgrade would do).
+#   2 = stock history table
+SCHEMA_VERSION = 2
+
+
+class DatabaseTooNewError(Exception):
+    """The database was written by a newer version of the app than the one now running."""
+
+
 MAPPING_FIELDS = ("alias", "item_code", "description")
 
 # Excel renders long numbers such as barcodes as 9.32877E+12 once the cell is
@@ -219,6 +232,15 @@ class ProductCatalog:
     def ensure_schema(self):
         conn = self._connect()
         try:
+            found_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if found_version > SCHEMA_VERSION:
+                raise DatabaseTooNewError(
+                    "This stock database was created by a newer version of Stock Tracker "
+                    f"(database format {found_version}, this version understands {SCHEMA_VERSION}). "
+                    "Update Stock Tracker to the latest version before opening it."
+                )
+            if found_version < SCHEMA_VERSION:
+                self._backup_before_schema_upgrade(conn)
             cur = conn.cursor()
             cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
             cur.execute('''
@@ -270,9 +292,38 @@ class ProductCatalog:
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_sys_key_expiry "
                     "ON inventory(sys_key, expiry_date)"
                 )
+
+            history_is_new = stock_history.ensure_schema(conn)
+            if history_is_new and columns:
+                # Stock that existed before logging began, so the history adds up from day one.
+                for sys_key, expiry, quantity in cur.execute(
+                    "SELECT sys_key, expiry_date, quantity FROM inventory WHERE quantity > 0"
+                ).fetchall():
+                    stock_history.record(
+                        conn, "BASELINE", "system", sys_key=sys_key, expiry=expiry,
+                        delta=quantity, before=0, after=quantity,
+                        note="Stock on hand when history logging started.",
+                    )
+
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
         finally:
             conn.close()
+
+    def _backup_before_schema_upgrade(self, conn):
+        """One-time safety copy taken just before an existing database is upgraded to this
+        version's format, so a problem can never cost the user their stock records."""
+        has_stock = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'inventory'"
+        ).fetchone()[0] and conn.execute("SELECT COUNT(*) FROM inventory").fetchone()[0]
+        backup_path = f"{self.db_path}.pre-v{SCHEMA_VERSION}.bak"
+        if not has_stock or os.path.exists(backup_path):
+            return
+        target = sqlite3.connect(backup_path)
+        try:
+            conn.backup(target)
+        finally:
+            target.close()
 
     def _backup_before_migration(self, conn):
         """Keeps a copy of the database from before inventory was re-keyed by
@@ -393,8 +444,13 @@ class ProductCatalog:
         self._index_add(cursor.lastrowid, "", key, placeholder=True)
         return cursor.lastrowid
 
-    def _apply_delta(self, conn, sys_key, barcode, action, expiry, quantity):
+    def _apply_delta(self, conn, sys_key, barcode, action, expiry, quantity,
+                     source="phone", scanned_at=None, note=""):
         delta = quantity if action == "ADD" else -quantity
+        existing = conn.execute(
+            "SELECT quantity FROM inventory WHERE sys_key = ? AND expiry_date = ?", (sys_key, expiry)
+        ).fetchone()
+        before = existing[0] if existing else 0
         conn.execute(
             "INSERT INTO inventory (barcode, expiry_date, quantity, last_updated, sys_key) "
             "VALUES (?, ?, ?, ?, ?) "
@@ -403,6 +459,17 @@ class ProductCatalog:
             (barcode, expiry, delta, datetime.now().isoformat(), sys_key),
         )
         self.bump_inventory_revision(conn)
+
+        # A removal larger than the stock on hand is cleared to zero; the history says so.
+        wanted = before + delta
+        after = max(wanted, 0)
+        if wanted < 0:
+            note = (note + " " if note else "") + f"Removal exceeded stock by {-wanted}."
+        stock_history.record(
+            conn, "SCAN_ADD" if action == "ADD" else "SCAN_REMOVE", source, sys_key=sys_key,
+            raw_code=barcode, expiry=expiry, delta=after - before, before=before, after=after,
+            scanned_at=scanned_at, note=note,
+        )
 
     def apply_scan(self, conn, barcode, action, expiry, quantity, scanned_at=None):
         """Applies one scan on `conn` (the caller commits). Returns 'applied',
@@ -417,6 +484,11 @@ class ProductCatalog:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (barcode, action, expiry, quantity, scanned_at, _now()),
             )
+            stock_history.record(
+                conn, "SCAN_HELD", "phone", raw_code=barcode, expiry=expiry, delta=0, scanned_at=scanned_at,
+                note="Matches several products; waiting in Pending scans.",
+                details={"action": action, "quantity": quantity, "candidate_product_keys": candidates},
+            )
             return "pending"
 
         status = "applied"
@@ -426,7 +498,8 @@ class ProductCatalog:
             sys_key = self._get_or_create_placeholder(conn, barcode)
             status = "unnamed"
 
-        self._apply_delta(conn, sys_key, barcode, action, expiry, quantity)
+        note = "Unknown code: recorded under an unnamed product." if status == "unnamed" else ""
+        self._apply_delta(conn, sys_key, barcode, action, expiry, quantity, "phone", scanned_at, note)
         return status
 
     # -- pending scans -----------------------------------------------------
@@ -458,18 +531,20 @@ class ProductCatalog:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT barcode, action, expiry, quantity FROM pending_scans WHERE id = ?", (pending_id,)
+                "SELECT barcode, action, expiry, quantity, scanned_at FROM pending_scans WHERE id = ?", (pending_id,)
             ).fetchone()
             if not row:
                 return False
-            barcode, action, expiry, quantity = row
+            barcode, action, expiry, quantity, scanned_at = row
+            chose_product = sys_key is not None
 
             if sys_key is None:
                 sys_key = self._get_or_create_placeholder(conn, barcode)
             elif not conn.execute("SELECT 1 FROM products WHERE sys_key = ?", (sys_key,)).fetchone():
                 raise ValueError("That product no longer exists.")
 
-            self._apply_delta(conn, sys_key, barcode, action, expiry, quantity)
+            note = "Resolved from Pending scans." if chose_product else "Pending scan recorded as an unnamed product."
+            self._apply_delta(conn, sys_key, barcode, action, expiry, quantity, "phone", scanned_at, note)
             conn.execute("DELETE FROM pending_scans WHERE id = ?", (pending_id,))
             conn.execute("DELETE FROM inventory WHERE quantity <= 0")
             conn.commit()
@@ -528,6 +603,52 @@ class ProductCatalog:
         finally:
             conn.close()
         return {"total": total, "unnamed": unnamed}
+
+    # -- removals and system notes ----------------------------------------
+
+    def remove_stock_rows(self, inventory_ids, note="Removed from the dashboard.", event="REMOVE"):
+        """Deletes stock rows, writing one history event per row in the same transaction.
+        Returns how many rows were removed."""
+        conn = self._connect()
+        removed = 0
+        try:
+            for inventory_id in inventory_ids:
+                row = conn.execute(
+                    "SELECT sys_key, expiry_date, quantity FROM inventory WHERE id = ?", (inventory_id,)
+                ).fetchone()
+                if not row:
+                    continue
+                sys_key, expiry, quantity = row
+                stock_history.record(conn, event, "desktop", sys_key=sys_key, expiry=expiry,
+                                     delta=-quantity, before=quantity, after=0, note=note)
+                conn.execute("DELETE FROM inventory WHERE id = ?", (inventory_id,))
+                removed += 1
+            self.bump_inventory_revision(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return removed
+
+    def clear_stock(self, note="All stock cleared by 'Reset App State'."):
+        """Removes every stock row (logging each one as part of an app reset)."""
+        conn = self._connect()
+        try:
+            ids = [row[0] for row in conn.execute("SELECT id FROM inventory")]
+        finally:
+            conn.close()
+        return self.remove_stock_rows(ids, note=note, event="RESET")
+
+    def log_system_event(self, note, details=None):
+        """Records a non-stock event (a setting changed, credentials replaced, ...)."""
+        conn = self._connect()
+        try:
+            stock_history.record(conn, "SYSTEM", "system", note=note, details=details)
+            conn.commit()
+        finally:
+            conn.close()
 
     # -- manual edits ------------------------------------------------------
 
@@ -601,13 +722,15 @@ class ProductCatalog:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT i.sys_key, i.expiry_date, p.code_key, p.alias_key, p.is_placeholder "
+                "SELECT i.sys_key, i.expiry_date, p.code_key, p.alias_key, p.is_placeholder, "
+                "p.description, p.alias, p.item_code, i.quantity "
                 "FROM inventory i JOIN products p ON p.sys_key = i.sys_key WHERE i.id = ?",
                 (inventory_id,),
             ).fetchone()
             if not row:
                 raise ValueError("That stock row no longer exists. Refresh and try again.")
-            sys_key, old_expiry, old_code_key, old_alias_key, old_placeholder = row
+            (sys_key, old_expiry, old_code_key, old_alias_key, old_placeholder,
+             old_description, old_alias, old_item_code, old_quantity) = row
 
             if (code_key, alias_key) != (old_code_key, old_alias_key):
                 clash = conn.execute(
@@ -643,6 +766,20 @@ class ProductCatalog:
                 "UPDATE inventory SET expiry_date = ?, quantity = ?, last_updated = ? WHERE id = ?",
                 (expiry, quantity, datetime.now().isoformat(), inventory_id),
             )
+
+            changed = {
+                label: [old, new] for label, old, new in (
+                    ("name", old_description, description), ("alias", old_alias, alias),
+                    ("item_code", old_item_code, item_code), ("expiry", old_expiry, expiry),
+                    ("quantity", old_quantity, quantity),
+                ) if old != new
+            }
+            if changed:
+                stock_history.record(
+                    conn, "EDIT", "desktop", sys_key=sys_key, expiry=expiry, delta=quantity - old_quantity,
+                    before=old_quantity, after=quantity, note="Manual edit.", details={"changed": changed},
+                )
+
             if dry_run:
                 conn.rollback()
                 return
@@ -708,6 +845,7 @@ class ProductCatalog:
                     "VALUES (?, ?, ?, ?)",
                     (filename, _now(), json.dumps(summary), self.get_revision(conn)),
                 )
+                stock_history.record(conn, "IMPORT", "import", note=f"Catalog import: {filename}", details=summary)
                 conn.commit()
         except Exception:
             conn.rollback()
@@ -739,18 +877,27 @@ class ProductCatalog:
             )
         ''').fetchone()[0]
 
-    def _merge_inventory(self, conn, from_key, to_key):
+    def _merge_inventory(self, conn, from_key, to_key, from_label=""):
         rows = conn.execute(
             "SELECT barcode, expiry_date, quantity, last_updated FROM inventory WHERE sys_key = ?",
             (from_key,),
         ).fetchall()
         for barcode, expiry, quantity, updated in rows:
+            existing = conn.execute(
+                "SELECT quantity FROM inventory WHERE sys_key = ? AND expiry_date = ?", (to_key, expiry)
+            ).fetchone()
+            before = existing[0] if existing else 0
             conn.execute(
                 "INSERT INTO inventory (barcode, expiry_date, quantity, last_updated, sys_key) "
                 "VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(sys_key, expiry_date) DO UPDATE SET "
                 "quantity = quantity + excluded.quantity, last_updated = excluded.last_updated",
                 (barcode, expiry, quantity, updated, to_key),
+            )
+            stock_history.record(
+                conn, "MERGE", "import", sys_key=to_key, raw_code=barcode, expiry=expiry,
+                delta=quantity, before=before, after=before + quantity,
+                note=f"Stock recorded under the unnamed product '{from_label or barcode}' merged into this product.",
             )
         conn.execute("DELETE FROM inventory WHERE sys_key = ?", (from_key,))
 
@@ -810,7 +957,7 @@ class ProductCatalog:
                 (key, key),
             )]
             if len(matches) == 1:
-                self._merge_inventory(conn, placeholder_key, matches[0])
+                self._merge_inventory(conn, placeholder_key, matches[0], from_label=key)
                 conn.execute("DELETE FROM products WHERE sys_key = ?", (placeholder_key,))
                 absorbed += 1
             elif len(matches) > 1:
@@ -872,7 +1019,8 @@ class ProductCatalog:
         allowed, message = self.can_undo_last_import()
         if not allowed:
             raise ValueError(message)
-        batch_id = self.last_import()[0]
+        batch = self.last_import()
+        batch_id, filename = batch[0], batch[1]
 
         conn = self._connect()
         try:
@@ -881,6 +1029,8 @@ class ProductCatalog:
                 conn.execute(f"DELETE FROM {table}")
                 conn.execute(f"INSERT INTO {table} ({columns}) SELECT {columns} FROM snap_{table}")
             conn.execute("UPDATE import_batches SET undone = 1 WHERE id = ?", (batch_id,))
+            stock_history.record(conn, "IMPORT_UNDO", "desktop", note=f"Undid the catalog import of {filename}.",
+                                 details={"batch_id": batch_id})
             conn.commit()
         except Exception:
             conn.rollback()

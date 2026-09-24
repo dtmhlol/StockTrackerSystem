@@ -15,7 +15,7 @@ binaries = []
 hiddenimports = ["qrcode", "qrcode.image.pil", "PIL.Image", "PIL.ImageTk", "PIL._tkinter_finder"]
 
 # Firebase / Firestore / gRPC ship data files and lazily loaded submodules.
-for package in ("firebase_admin", "google.cloud.firestore", "google.cloud.firestore_v1", "grpc"):
+for package in ("firebase_admin", "google.cloud.firestore", "google.cloud.firestore_v1", "grpc", "reportlab"):
     package_datas, package_binaries, package_hidden = collect_all(package)
     datas += package_datas
     binaries += package_binaries

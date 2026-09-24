@@ -1,4 +1,4 @@
-"""
+﻿"""
 Where the app keeps its files.
 
 Run from source, everything stays in the project folder (database/, config/), as
@@ -8,7 +8,19 @@ wiped on upgrade/uninstall, so data lives in %LOCALAPPDATA%\\StockTracker instea
 import os
 import sys
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
+
+# Updates come from this repository's GitHub Releases.
+GITHUB_REPO = "dtmhlol/StockTrackerSystem"
+UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+# Public half of the release signing key (base64). Installers are only accepted if signed by
+# the matching private key. Created with:  python installer\release_tools.py init-key
+UPDATE_PUBLIC_KEY = "CaxvWbJkpJFw/Z5DKh2LIkpMq8ykrA5dbHwj4pPvCX8="
+
+# Where the phone page is hosted. Connect Mobile shows a QR code for this address unless
+# a different one has been saved there (e.g. a client hosting their own copy).
+DEFAULT_MOBILE_APP_URL = "https://dtmhlol.github.io/StockTrackerSystem/"
 DATA_FOLDER = "StockTracker"
 
 

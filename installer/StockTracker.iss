@@ -3,12 +3,23 @@
 #ifndef AppVersion
   #define AppVersion "1.0.0"
 #endif
-#define AppName "Stock Tracker"
 #define AppExe "StockTracker.exe"
 
+; /DTestBuild makes a clearly separate installer (its own app ID, name and file name) so the
+; upgrade path can be tested without touching a real installation.
+#ifdef TestBuild
+  #define AppName "Stock Tracker E2E TEST"
+  #define AppGuid "{{FEEDFACE-0000-4000-8000-00000000E2E1}"
+  #define OutputName "E2E-TEST-Setup-" + AppVersion
+#else
+  #define AppName "Stock Tracker"
+  ; Keep this GUID fixed forever: it is how Windows recognises upgrades of the same app.
+  #define AppGuid "{{09AC96D6-3F59-4D47-BCE8-143E43C6101A}"
+  #define OutputName "StockTracker-Setup-" + AppVersion
+#endif
+
 [Setup]
-; Keep this GUID fixed forever: it is how Windows recognises upgrades of the same app.
-AppId={{09AC96D6-3F59-4D47-BCE8-143E43C6101A}
+AppId={#AppGuid}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppName}
@@ -21,7 +32,7 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=Output
-OutputBaseFilename=StockTracker-Setup-{#AppVersion}
+OutputBaseFilename={#OutputName}
 SetupIconFile=app.ico
 UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2
@@ -42,23 +53,36 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+; The in-app updater runs this installer silently with /RELAUNCH=1, so the app reopens by itself.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RelaunchRequested
 
 [Code]
-// Uninstalling removes the program but, by default, keeps the stock database and the
-// encrypted Firebase credentials in %LOCALAPPDATA%\StockTracker, so a reinstall or
-// upgrade never loses data. This offers to remove them too.
+// True when the installer was started by the in-app updater (/RELAUNCH=1).
+function RelaunchRequested: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
+// Uninstalling removes the program but keeps the stock database and the encrypted Firebase
+// credentials in %LOCALAPPDATA%\StockTracker, so a reinstall or upgrade never loses data.
+// Only an interactive uninstall may offer to delete them, and it defaults to NO. A silent
+// uninstall (scripts, tests, IT tools) never asks and never deletes anything: a plain MsgBox
+// is NOT suppressed by /SUPPRESSMSGBOXES, so without this guard a stray click could wipe data.
+// Test builds compile the deletion out entirely.
+#ifndef TestBuild
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: String;
 begin
-  if CurUninstallStep = usPostUninstall then
+  if (CurUninstallStep = usPostUninstall) and (not UninstallSilent) then
   begin
     DataDir := ExpandConstant('{localappdata}\StockTracker');
     if DirExists(DataDir) then
-      if MsgBox('Also delete your stock data and saved Firebase credentials?' + #13#10 + #13#10 +
+      if SuppressibleMsgBox('Also delete your stock data and saved Firebase credentials?' + #13#10 + #13#10 +
                 DataDir + #13#10 + #13#10 +
-                'Choose No to keep them (recommended if you plan to reinstall).',
-                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+                'This cannot be undone. Choose No to keep them (recommended if you plan to reinstall).',
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
         DelTree(DataDir, True, True, True);
   end;
 end;
+#endif

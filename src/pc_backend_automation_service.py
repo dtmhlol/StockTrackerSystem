@@ -5,24 +5,38 @@ import sqlite3
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import webbrowser
 import importlib.util
 import json
+import queue
 import random
 import string
+import threading
+from urllib.parse import urlparse
 
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore as admin_firestore
 
 import app_paths
+import expiry_report
 import secure_store
+import stock_history
+import updater
 from product_catalog import (
-    ProductCatalog, PLACEHOLDER_LABEL, MAPPING_FIELDS, read_table, guess_mapping,
+    ProductCatalog, DatabaseTooNewError, PLACEHOLDER_LABEL, MAPPING_FIELDS, read_table, guess_mapping,
     validate_mapping, parse_rows, format_import_summary,
 )
 from ui_theme import ThemeManager, ThemedScrolledText, UI_FONT, make_button, system_prefers_dark
+
+# Dashboard label and row colour for each status code from expiry_report.status_for
+TREE_STATUS = {
+    "expired": ("EXPIRED", "expired"),
+    "expiring_soon": ("Expiring Soon", "expiring_soon"),
+    "good": ("Good", "good"),
+    "invalid": ("Invalid Date", "good"),
+}
 
 # Stock expiring within this many days is highlighted as "expiring soon".
 WARNING_DAY_PRESETS = (30, 60, 90)
@@ -112,6 +126,28 @@ def validate_service_account_file(path):
     return validate_service_account_info(data)
 
 
+def normalize_mobile_url(text):
+    """
+    Validates the address where the phone page is hosted.
+
+    Returns (is_valid, url_or_message). A missing scheme is assumed to be https,
+    and plain http is refused because phone browsers only allow the camera on
+    secure pages (localhost excepted, for testing).
+    """
+    text = (text or "").strip()
+    if not text:
+        return False, "Enter the address where you hosted the phone page."
+    if "://" not in text:
+        text = "https://" + text
+
+    parsed = urlparse(text)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or " " in text:
+        return False, "That doesn't look like a web address."
+    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1"):
+        return False, "The address must start with https:// because phone browsers only allow the camera on secure pages."
+    return True, text
+
+
 class StockTrackerApp:
     def __init__(self, root):
         self.root = root
@@ -130,6 +166,7 @@ class StockTrackerApp:
         self.legend_soon_label = None
         self.row_menu = None
         self.catalog_refresh = None
+        self.history_window = None
         self.expiry_warning_days = DEFAULT_WARNING_DAYS
 
         # init_db() must run first — it creates the settings table that
@@ -231,12 +268,20 @@ class StockTrackerApp:
 
     def set_warning_days(self, days, refresh=True):
         """Saves the expiring-soon window and updates the legend and table colours."""
+        previous = self.expiry_warning_days
         self.expiry_warning_days = days
+        if days != previous:
+            self.catalog.log_system_event(
+                f"Expiring-soon window changed from {previous} to {days} days.", {"from": previous, "to": days})
         self.save_setting("expiry_warning_days", str(days))
         if self.legend_soon_label is not None:
             self.legend_soon_label.config(text=f"■  Expiring within {days} days")
         if refresh and getattr(self, "tree", None) is not None:
             self.refresh_data(run_sync=False)
+
+    def get_mobile_app_url(self):
+        """The saved phone page address, or the built-in default."""
+        return self.get_setting("mobile_app_url") or app_paths.DEFAULT_MOBILE_APP_URL
 
     def toggle_theme(self):
         """Switches between light and dark mode and remembers the choice."""
@@ -390,6 +435,11 @@ class StockTrackerApp:
         self.connect_firestore()
         self.notify_credentials_changed()
 
+        self.catalog.log_system_event(
+            "Firebase credentials replaced." if previous else "Firebase credentials stored.",
+            {"project_id": data["project_id"], "account": data["client_email"]},
+        )
+
         # Plain-text copies are the main leak risk, so offer to remove every one.
         copies = [path]
         legacy = self.get_service_account_path()
@@ -437,6 +487,10 @@ class StockTrackerApp:
         problem = self.delete_plaintext_key(legacy)
         self.reload_credentials()
         self.notify_credentials_changed()
+        self.catalog.log_system_event(
+            "Firebase credentials moved into encrypted storage.",
+            {"project_id": info.get("project_id"), "account": info.get("client_email")},
+        )
         messagebox.showinfo(
             "Firebase key protected",
             "The key is now stored encrypted." + (f"\n\n{problem}" if problem else "")
@@ -621,9 +675,9 @@ class StockTrackerApp:
     def reset_app_state(self):
         """Resets the app to its first-run state by clearing saved data and setup settings."""
         try:
+            self.catalog.clear_stock()   # logged row by row; the history itself is never cleared
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM inventory")
             cursor.execute("DELETE FROM settings")
             conn.commit()
             conn.close()
@@ -660,7 +714,7 @@ class StockTrackerApp:
         def confirm_reset():
             confirm = messagebox.askyesno(
                 "Reset App State",
-                "This will clear inventory data, the saved Firebase web config, and all local setup. Continue?"
+                "This will clear inventory data, the saved Firebase web config, and all local setup. The stock history is kept. Continue?"
             )
             if not confirm:
                 return
@@ -938,6 +992,8 @@ class StockTrackerApp:
         make_button(toolbar, "📦  Products", self.open_catalog_window, "primary").pack(side=tk.LEFT, padx=(0, 10))
         self.pending_button = make_button(toolbar, "⚠  Pending scans (0)", self.open_pending_window, "muted")
         self.pending_button.pack(side=tk.LEFT)
+        make_button(toolbar, "⬇  Export", self.open_export_dialog, "neutral").pack(side=tk.LEFT, padx=(10, 0))
+        make_button(toolbar, "🕘  History", self.open_history_window, "neutral").pack(side=tk.LEFT, padx=(10, 0))
 
         make_button(toolbar, "🛠  Dev Tools", self.open_developer_tools, "neutral").pack(side=tk.RIGHT, padx=(10, 0))
         make_button(toolbar, "⚙  Settings", self.open_settings_window, "neutral").pack(side=tk.RIGHT, padx=(10, 0))
@@ -1022,26 +1078,8 @@ class StockTrackerApp:
                 barcode = alias or raw_barcode
                 item_code = item_code or ""
 
-                # Default status
-                status = "Good"
-                tag = "good"
-                
-                try:
-                    # Parse YYYY-MM (e.g. 2026-12) format from the mobile app
-                    expiry_date = datetime.strptime(expiry_str, "%Y-%m")
-                    
-                    # Calculate days difference (approximating to the end of the month)
-                    days_until_expiry = (expiry_date - current_date).days
-                    
-                    if days_until_expiry < 0:
-                        status = "EXPIRED"
-                        tag = "expired"
-                    elif days_until_expiry < self.expiry_warning_days:
-                        status = "Expiring Soon"
-                        tag = "expiring_soon"
-                except ValueError:
-                    status = "Invalid Date"
-                    
+                status, tag = TREE_STATUS[expiry_report.status_for(expiry_str, self.expiry_warning_days, current_date)]
+
                 # Insert row into tree
                 self.tree.insert("", tk.END, values=(db_id, product_name, barcode, item_code, expiry_str, qty, status), tags=(tag,))
 
@@ -1071,21 +1109,10 @@ class StockTrackerApp:
         
         if confirm:
             try:
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
-                
-                for item in selected_items:
-                    # Get the ID (first column) of the selected row
-                    item_values = self.tree.item(item, 'values')
-                    db_id = item_values[0]
-                    
-                    # Delete from database
-                    cursor.execute("DELETE FROM inventory WHERE id=?", (db_id,))
+                # The catalog deletes the rows and writes one history event per row, together.
+                ids = [int(self.tree.item(item, "values")[0]) for item in selected_items]
+                self.catalog.remove_stock_rows(ids)
 
-                self.catalog.bump_inventory_revision(conn)
-                conn.commit()
-                conn.close()
-                
                 # Refresh UI to show updated data
                 self.refresh_data()
                 messagebox.showinfo("Success", "Items successfully removed.")
@@ -1426,6 +1453,597 @@ class StockTrackerApp:
         refresh()
         self.theme.style(win)
 
+    def open_export_dialog(self):
+        """Exports the expiry list as PDF or CSV: filtered by status and month, optionally
+        grouped, and sorted by any column."""
+        rows = expiry_report.load_rows(self.db_path, self.expiry_warning_days)
+        if not rows:
+            messagebox.showinfo("Export expiry list", "There is no stock to export yet.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Export Expiry List")
+        win.geometry(f"660x{min(700, win.winfo_screenheight() - 110)}")
+        win.configure(bg="white")
+        win.transient(self.root)
+        win.grab_set()
+
+        footer = tk.Frame(win, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        body = tk.Frame(win, bg="white", padx=24, pady=18)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(body, text="Export expiry list", font=(UI_FONT, 14, "bold"), bg="white", fg="#111827").pack(anchor="w")
+        tk.Label(body, text="Choose what to include and how to arrange it, then save it as a PDF or CSV file.", font=(UI_FONT, 9), bg="white", fg="#6b7280").pack(anchor="w", pady=(2, 12))
+
+        def card(title):
+            frame = tk.Frame(body, bg="#f9fafb", relief=tk.SOLID, bd=1, padx=16, pady=12)
+            frame.pack(fill=tk.X, pady=(0, 12))
+            tk.Label(frame, text=title, font=(UI_FONT, 10, "bold"), bg="#f9fafb", fg="#111827").pack(anchor="w", pady=(0, 6))
+            return frame
+
+        def line(parent, label):
+            row = tk.Frame(parent, bg="#f9fafb")
+            row.pack(fill=tk.X, pady=3)
+            tk.Label(row, text=label, width=10, anchor="w", font=(UI_FONT, 9, "bold"), bg="#f9fafb", fg="#374151").pack(side=tk.LEFT)
+            return row
+
+        def check(parent, text, variable, command=None, value=None):
+            options = dict(text=text, variable=variable, command=command, bg="#f9fafb", fg="#111827",
+                           font=(UI_FONT, 10), anchor="w", bd=0, highlightthickness=0)
+            if value is None:
+                return tk.Checkbutton(parent, **options)
+            return tk.Radiobutton(parent, value=value, **options)
+
+        # -- what to include --
+        include = card("What to include")
+
+        status_row = line(include, "Status")
+        status_vars = {}
+        for code in expiry_report.STATUS_ORDER:
+            status_vars[code] = tk.BooleanVar(value=True)
+            check(status_row, expiry_report.STATUS_LABELS[code], status_vars[code], lambda: update_preview()).pack(side=tk.LEFT, padx=(0, 12))
+
+        month_choices = {"Any month": None}
+        for month in expiry_report.months_available(rows):
+            month_choices[expiry_report.format_month(month)] = month
+        month_row = line(include, "Months")
+        tk.Label(month_row, text="From", font=(UI_FONT, 9), bg="#f9fafb", fg="#4b5563").pack(side=tk.LEFT, padx=(0, 6))
+        from_combo = ttk.Combobox(month_row, values=list(month_choices), state="readonly", width=16)
+        from_combo.set("Any month")
+        from_combo.pack(side=tk.LEFT)
+        tk.Label(month_row, text="To", font=(UI_FONT, 9), bg="#f9fafb", fg="#4b5563").pack(side=tk.LEFT, padx=(14, 6))
+        to_combo = ttk.Combobox(month_row, values=list(month_choices), state="readonly", width=16)
+        to_combo.set("Any month")
+        to_combo.pack(side=tk.LEFT)
+        tk.Label(include, text="Pick the same month in both boxes to export a single month.", font=(UI_FONT, 8), bg="#f9fafb", fg="#6b7280").pack(anchor="w", pady=(2, 0))
+
+        preview_var = tk.StringVar()
+        preview_label = tk.Label(include, textvariable=preview_var, font=(UI_FONT, 9, "bold"), bg="#f9fafb", fg="#1d4ed8")
+        preview_label.pack(anchor="w", pady=(8, 0))
+
+        # -- how to arrange it --
+        arrange = card("How to arrange it")
+
+        group_var = tk.StringVar(value="none")
+        group_row = line(arrange, "Group by")
+        for text, value in (("No grouping", "none"), ("Status", "status"), ("Month", "month")):
+            check(group_row, text, group_var, lambda: update_preview(), value=value).pack(side=tk.LEFT, padx=(0, 14))
+
+        column_keys = {heading: key for key, heading in expiry_report.COLUMNS}
+        directions = ["Ascending", "Descending"]
+
+        sort_row = line(arrange, "Sort by")
+        sort1 = ttk.Combobox(sort_row, values=list(column_keys), state="readonly", width=18)
+        sort1.set(expiry_report.COLUMN_HEADINGS["expiry"])
+        sort1.pack(side=tk.LEFT)
+        sort1_dir = ttk.Combobox(sort_row, values=directions, state="readonly", width=12)
+        sort1_dir.set("Ascending")
+        sort1_dir.pack(side=tk.LEFT, padx=(8, 0))
+
+        then_row = line(arrange, "Then by")
+        sort2 = ttk.Combobox(then_row, values=["(none)"] + list(column_keys), state="readonly", width=18)
+        sort2.set(expiry_report.COLUMN_HEADINGS["product"])
+        sort2.pack(side=tk.LEFT)
+        sort2_dir = ttk.Combobox(then_row, values=directions, state="readonly", width=12)
+        sort2_dir.set("Ascending")
+        sort2_dir.pack(side=tk.LEFT, padx=(8, 0))
+
+        # -- file format --
+        file_card = card("File format")
+        format_var = tk.StringVar(value="pdf")
+        excel_var = tk.BooleanVar(value=True)
+        format_row = line(file_card, "Save as")
+        check(format_row, "PDF (for printing or sharing)", format_var, lambda: on_format(), value="pdf").pack(side=tk.LEFT, padx=(0, 14))
+        check(format_row, "CSV (for Excel)", format_var, lambda: on_format(), value="csv").pack(side=tk.LEFT)
+        excel_check = check(file_card, "Keep long barcodes and leading zeros intact in Excel", excel_var)
+        excel_check.pack(anchor="w", padx=(80, 0))
+
+        def on_format():
+            excel_check.config(state=tk.NORMAL if format_var.get() == "csv" else tk.DISABLED)
+
+        def current_choices():
+            statuses = {code for code, var in status_vars.items() if var.get()}
+            month_from, month_to = month_choices[from_combo.get()], month_choices[to_combo.get()]
+            error = None
+            if not statuses:
+                error = "Choose at least one status."
+            elif month_from and month_to and month_from > month_to:
+                error = "The 'From' month is after the 'To' month."
+            sort = [(column_keys[sort1.get()], sort1_dir.get() == "Descending")]
+            if sort2.get() != "(none)":
+                sort.append((column_keys[sort2.get()], sort2_dir.get() == "Descending"))
+            return {"statuses": statuses, "month_from": month_from, "month_to": month_to,
+                    "group_by": group_var.get(), "sort": sort, "error": error}
+
+        def build(choices):
+            return expiry_report.build_report(
+                rows, choices["statuses"], choices["month_from"], choices["month_to"],
+                choices["group_by"], choices["sort"],
+            )
+
+        def update_preview(_event=None):
+            choices = current_choices()
+            if choices["error"]:
+                preview_var.set(choices["error"])
+                self.theme.set_colors(preview_label, fg="#991b1b")
+                return
+            report = build(choices)
+            if report["total_items"]:
+                preview_var.set(f"{report['total_items']:,} items ({report['total_quantity']:,} units) will be exported.")
+                self.theme.set_colors(preview_label, fg="#1d4ed8")
+            else:
+                preview_var.set("Nothing matches these choices.")
+                self.theme.set_colors(preview_label, fg="#991b1b")
+
+        for combo in (from_combo, to_combo, sort1, sort1_dir, sort2, sort2_dir):
+            combo.bind("<<ComboboxSelected>>", update_preview)
+
+        def export():
+            choices = current_choices()
+            if choices["error"]:
+                messagebox.showwarning("Export expiry list", choices["error"], parent=win)
+                return
+            report = build(choices)
+            if not report["total_items"]:
+                messagebox.showwarning("Export expiry list", "Nothing matches these choices, so there is nothing to export.", parent=win)
+                return
+
+            as_pdf = format_var.get() == "pdf"
+            extension = ".pdf" if as_pdf else ".csv"
+            path = filedialog.asksaveasfilename(
+                parent=win,
+                title="Save expiry list",
+                defaultextension=extension,
+                initialfile=f"Expiry list {datetime.now().strftime('%Y-%m-%d')}{extension}",
+                filetypes=[("PDF document", "*.pdf")] if as_pdf else [("CSV file (opens in Excel)", "*.csv")],
+            )
+            if not path:
+                return
+
+            try:
+                if as_pdf:
+                    expiry_report.write_pdf(path, report, {
+                        "title": "Expiry Report",
+                        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "lines": expiry_report.describe(
+                            choices["statuses"], choices["month_from"], choices["month_to"],
+                            choices["group_by"], choices["sort"], self.expiry_warning_days,
+                        ),
+                        "footer": "Stock Tracker | Expiry report",
+                    })
+                else:
+                    expiry_report.write_csv(path, report, choices["group_by"], excel_var.get())
+            except ImportError:
+                messagebox.showerror("Export expiry list", "PDF export needs the 'reportlab' package.\n\nInstall it with:  python -m pip install reportlab", parent=win)
+                return
+            except PermissionError:
+                messagebox.showerror("Export expiry list", f"Couldn't save to:\n{path}\n\nIs the file open in another program? Close it and try again.", parent=win)
+                return
+            except OSError as e:
+                messagebox.showerror("Export expiry list", f"Couldn't save the file: {e}", parent=win)
+                return
+
+            win.destroy()
+            if messagebox.askyesno("Export complete", f"Saved {report['total_items']:,} items to:\n{path}\n\nOpen it now?"):
+                try:
+                    os.startfile(path)
+                except (AttributeError, OSError) as e:
+                    messagebox.showwarning("Export expiry list", f"Couldn't open the file: {e}")
+
+        make_button(footer, "Export", export, "primary").pack(side=tk.RIGHT)
+        make_button(footer, "Cancel", win.destroy, "neutral").pack(side=tk.RIGHT, padx=(0, 10))
+
+        on_format()
+        update_preview()
+        self.theme.style(win)
+
+    def open_history_window(self):
+        """Browse and export the stock history: every change ever made, newest first."""
+        if self.history_window is not None and self.history_window.winfo_exists():
+            self.history_window.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        self.history_window = win
+        win.title("Stock History")
+        win.geometry(f"1120x{min(740, win.winfo_screenheight() - 100)}")
+        win.configure(bg="white")
+
+        footer = tk.Frame(win, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        body = tk.Frame(win, bg="white", padx=24, pady=18)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(body, text="Stock history", font=(UI_FONT, 14, "bold"), bg="white", fg="#111827").pack(anchor="w")
+        tk.Label(
+            body,
+            text="Every change to stock: scans, edits, removals, imports. Entries can't be edited or deleted, "
+                 "so this is a reliable record. Export it as CSV for analysis.",
+            font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=1040, justify=tk.LEFT,
+        ).pack(anchor="w", pady=(2, 12))
+
+        filters = tk.Frame(body, bg="#f9fafb", relief=tk.SOLID, bd=1, padx=16, pady=12)
+        filters.pack(fill=tk.X)
+
+        # -- date range --
+        date_row = tk.Frame(filters, bg="#f9fafb")
+        date_row.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(date_row, text="Dates", width=8, anchor="w", font=(UI_FONT, 9, "bold"), bg="#f9fafb", fg="#374151").pack(side=tk.LEFT)
+        from_var, to_var = tk.StringVar(), tk.StringVar()
+        tk.Label(date_row, text="From", font=(UI_FONT, 9), bg="#f9fafb", fg="#4b5563").pack(side=tk.LEFT, padx=(0, 6))
+        tk.Entry(date_row, textvariable=from_var, width=12, relief=tk.SOLID, bd=1, font=(UI_FONT, 10)).pack(side=tk.LEFT, ipady=3)
+        tk.Label(date_row, text="To", font=(UI_FONT, 9), bg="#f9fafb", fg="#4b5563").pack(side=tk.LEFT, padx=(12, 6))
+        tk.Entry(date_row, textvariable=to_var, width=12, relief=tk.SOLID, bd=1, font=(UI_FONT, 10)).pack(side=tk.LEFT, ipady=3)
+        tk.Label(date_row, text="(YYYY-MM-DD, blank = no limit)", font=(UI_FONT, 8), bg="#f9fafb", fg="#6b7280").pack(side=tk.LEFT, padx=(10, 14))
+
+        def set_range(days_back):
+            today = datetime.now().date()
+            from_var.set("" if days_back is None else (today - timedelta(days=days_back)).isoformat())
+            to_var.set("" if days_back is None else today.isoformat())
+
+        for text, days_back in (("Today", 0), ("Last 7 days", 6), ("Last 30 days", 29), ("All time", None)):
+            make_button(date_row, text, lambda d=days_back: set_range(d), "neutral", padx=10, pady=2, font=(UI_FONT, 9)).pack(side=tk.LEFT, padx=(0, 6))
+
+        # -- event types --
+        event_row = tk.Frame(filters, bg="#f9fafb")
+        event_row.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(event_row, text="Events", width=8, anchor="nw", font=(UI_FONT, 9, "bold"), bg="#f9fafb", fg="#374151").pack(side=tk.LEFT, anchor="n")
+        event_grid = tk.Frame(event_row, bg="#f9fafb")
+        event_grid.pack(side=tk.LEFT)
+        event_vars = {}
+        for index, (code, label) in enumerate(stock_history.EVENT_LABELS.items()):
+            event_vars[code] = tk.BooleanVar(value=True)
+            tk.Checkbutton(event_grid, text=label, variable=event_vars[code], command=lambda: refresh(), bg="#f9fafb", fg="#111827",
+                           font=(UI_FONT, 9), anchor="w", bd=0, highlightthickness=0).grid(row=index // 4, column=index % 4, sticky="w", padx=(0, 18))
+
+        # -- search --
+        search_row = tk.Frame(filters, bg="#f9fafb")
+        search_row.pack(fill=tk.X)
+        tk.Label(search_row, text="Search", width=8, anchor="w", font=(UI_FONT, 9, "bold"), bg="#f9fafb", fg="#374151").pack(side=tk.LEFT)
+        search_var = tk.StringVar()
+        tk.Entry(search_row, textvariable=search_var, width=40, relief=tk.SOLID, bd=1, font=(UI_FONT, 10)).pack(side=tk.LEFT, ipady=3)
+        tk.Label(search_row, text="product name, alias, item code, code scanned or note", font=(UI_FONT, 8), bg="#f9fafb", fg="#6b7280").pack(side=tk.LEFT, padx=(10, 0))
+
+        count_var = tk.StringVar()
+        count_label = tk.Label(body, textvariable=count_var, font=(UI_FONT, 9, "bold"), bg="white", fg="#1d4ed8")
+        count_label.pack(anchor="w", pady=(10, 6))
+
+        # The details line is packed before the table so the table can't squeeze it out.
+        detail_var = tk.StringVar(value="Select an event to see its full details.")
+        tk.Label(body, textvariable=detail_var, font=(UI_FONT, 9), bg="white", fg="#4b5563", wraplength=1040,
+                 justify=tk.LEFT, anchor="w", height=2).pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+
+        # -- table --
+        table_frame = tk.Frame(body, bg="white", relief=tk.SOLID, bd=1)
+        table_frame.pack(fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(table_frame)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        columns = ("Time", "Event", "Product", "Alias", "Expiry", "Change", "Before", "After", "Note")
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings", yscrollcommand=scroll.set, height=10)
+        scroll.config(command=tree.yview)
+        tree.pack(fill=tk.BOTH, expand=True)
+        for column, width, anchor in (("Time", 140, tk.W), ("Event", 150, tk.W), ("Product", 200, tk.W), ("Alias", 120, tk.W),
+                                      ("Expiry", 80, tk.CENTER), ("Change", 78, tk.CENTER), ("Before", 78, tk.CENTER),
+                                      ("After", 70, tk.CENTER), ("Note", 300, tk.W)):
+            tree.heading(column, text=column.upper(), anchor=anchor)
+            tree.column(column, width=width, anchor=anchor)
+
+
+        shown = {}
+        pending_refresh = {"job": None}
+
+        def date_error():
+            for text in (from_var.get().strip(), to_var.get().strip()):
+                if text:
+                    try:
+                        datetime.strptime(text, "%Y-%m-%d")
+                    except ValueError:
+                        return "Dates must look like 2026-09-25."
+            return None
+
+        def normalized_dates():
+            return (from_var.get().strip() or None), (to_var.get().strip() or None)
+
+        def refresh(*_args):
+            error = date_error()
+            for item in tree.get_children():
+                tree.delete(item)
+            shown.clear()
+            if error:
+                count_var.set(error)
+                self.theme.set_colors(count_label, fg="#991b1b")
+                return
+            date_from, date_to = normalized_dates()
+            events, search = {c for c, v in event_vars.items() if v.get()}, search_var.get()
+            total = stock_history.count(self.db_path, date_from, date_to, events, search)
+            rows = stock_history.query(self.db_path, date_from, date_to, events, search, limit=500)
+            for row in rows:
+                shown[str(row["id"])] = row
+                delta = "" if row["quantity_delta"] is None else f"{row['quantity_delta']:+d}"
+                tree.insert("", tk.END, iid=str(row["id"]), values=(
+                    row["occurred_at"][:19].replace("T", " "), stock_history.EVENT_LABELS.get(row["event"], row["event"]),
+                    row["product"], row["alias"], row["expiry"], delta,
+                    "" if row["quantity_before"] is None else row["quantity_before"],
+                    "" if row["quantity_after"] is None else row["quantity_after"], row["note"],
+                ))
+            text = f"{total:,} event{'s' if total != 1 else ''} match"
+            if total > len(rows):
+                text += f" (showing the newest {len(rows):,}; the export includes all {total:,})"
+            count_var.set(text + ".")
+            self.theme.set_colors(count_label, fg="#1d4ed8")
+
+        def schedule_refresh(*_args):
+            if pending_refresh["job"] is not None:
+                win.after_cancel(pending_refresh["job"])
+            pending_refresh["job"] = win.after(250, refresh)
+
+        def show_detail(_event=None):
+            selection = tree.selection()
+            if not selection:
+                return
+            row = shown[selection[0]]
+            parts = [f"{stock_history.EVENT_LABELS.get(row['event'], row['event'])} at {row['occurred_at']} (source: {row['source']})"]
+            if row["raw_code"]:
+                parts.append(f"Code scanned: {row['raw_code']}")
+            if row["scanned_at"]:
+                parts.append(f"Phone clock: {row['scanned_at']}")
+            if row["note"]:
+                parts.append(row["note"])
+            if row["details"]:
+                parts.append(f"Details: {row['details']}")
+            detail_var.set("   |   ".join(parts))
+
+        tree.bind("<<TreeviewSelect>>", show_detail)
+        for variable in (from_var, to_var, search_var):
+            variable.trace_add("write", schedule_refresh)
+
+        # -- export --
+        excel_var = tk.BooleanVar(value=False)
+
+        def export():
+            error = date_error()
+            if error:
+                messagebox.showwarning("Export stock history", error, parent=win)
+                return
+            date_from, date_to = normalized_dates()
+            events, search = {c for c, v in event_vars.items() if v.get()}, search_var.get()
+            rows = stock_history.query(self.db_path, date_from, date_to, events, search, newest_first=False)
+            if not rows:
+                messagebox.showwarning("Export stock history", "No events match the current filters.", parent=win)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=win, title="Save stock history", defaultextension=".csv",
+                initialfile=f"Stock history {datetime.now():%Y-%m-%d}.csv",
+                filetypes=[("CSV file (opens in Excel)", "*.csv")],
+            )
+            if not path:
+                return
+            try:
+                stock_history.write_csv(path, rows, excel_friendly=excel_var.get())
+            except PermissionError:
+                messagebox.showerror("Export stock history", f"Couldn't save to:\n{path}\n\nIs the file open in another program? Close it and try again.", parent=win)
+                return
+            except OSError as e:
+                messagebox.showerror("Export stock history", f"Couldn't save the file: {e}", parent=win)
+                return
+            if messagebox.askyesno("Export complete", f"Saved {len(rows):,} events to:\n{path}\n\nOpen it now?", parent=win):
+                try:
+                    os.startfile(path)
+                except (AttributeError, OSError) as e:
+                    messagebox.showwarning("Export stock history", f"Couldn't open the file: {e}", parent=win)
+
+        make_button(footer, "Export CSV...", export, "primary").pack(side=tk.LEFT)
+        tk.Checkbutton(footer, text="Excel-friendly barcodes (keeps leading zeros; leave off for data analysis)", variable=excel_var,
+                       bg="white", fg="#111827", font=(UI_FONT, 9), bd=0, highlightthickness=0).pack(side=tk.LEFT, padx=(14, 0))
+        make_button(footer, "Close", win.destroy, "neutral").pack(side=tk.RIGHT)
+
+        set_range(None)
+        refresh()
+        self.theme.style(win)
+
+    def check_for_updates(self, parent, status_var, button):
+        """Manual update check. Asks GitHub for the latest release in the background, then tells
+        the user whether they're current or shows what's new."""
+        button.config(state=tk.DISABLED)
+        status_var.set("Checking GitHub...")
+        outcome = queue.Queue()
+
+        def work():
+            try:
+                outcome.put(("ok", updater.fetch_latest()))
+            except updater.UpdateError as e:
+                outcome.put(("error", str(e)))
+            except Exception as e:  # never let the worker die silently
+                outcome.put(("error", f"Unexpected problem: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                kind, value = outcome.get_nowait()
+            except queue.Empty:
+                parent.after(100, poll)
+                return
+            try:
+                button.config(state=tk.NORMAL)
+                if kind == "error":
+                    status_var.set(value)
+                    messagebox.showwarning("Check for updates", value, parent=parent)
+                elif not updater.is_newer(value.version, app_paths.APP_VERSION):
+                    status_var.set(f"You're up to date (version {app_paths.APP_VERSION}).")
+                    messagebox.showinfo("Check for updates", f"You're up to date.\n\nInstalled version: {app_paths.APP_VERSION}\nLatest release: {value.version}", parent=parent)
+                else:
+                    status_var.set(f"Version {value.version} is available.")
+                    self.show_update_dialog(parent, value)
+            except tk.TclError:
+                pass  # the Settings window was closed while checking
+
+        parent.after(100, poll)
+
+    def show_update_dialog(self, parent, release):
+        """Shows what's new in a release and offers a one-click install."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Update Available")
+        dlg.geometry("640x600")
+        dlg.configure(bg="white")
+        dlg.transient(parent)
+
+        footer = tk.Frame(dlg, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        body = tk.Frame(dlg, bg="white", padx=24, pady=20)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(body, text=f"Version {release.version} is available", font=(UI_FONT, 14, "bold"), bg="white", fg="#111827").pack(anchor="w")
+        tk.Label(body, text=f"You have version {app_paths.APP_VERSION}.", font=(UI_FONT, 9), bg="white", fg="#6b7280").pack(anchor="w", pady=(2, 12))
+        tk.Label(body, text="What's new", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(0, 4))
+
+        notes = ThemedScrolledText(body, height=12, wrap=tk.WORD, font=(UI_FONT, 10), relief=tk.SOLID, bd=1)
+        notes.pack(fill=tk.BOTH, expand=True)
+        notes.insert("1.0", release.notes or "(This release has no notes.)")
+        notes.configure(state="disabled")
+
+        blocker = updater.install_blocker(release)
+        if blocker:
+            tk.Label(body, text=blocker, font=(UI_FONT, 9), bg="white", fg="#92400e", wraplength=580, justify=tk.LEFT).pack(anchor="w", pady=(10, 0))
+
+        progress_var = tk.StringVar()
+        tk.Label(body, textvariable=progress_var, font=(UI_FONT, 9), bg="white", fg="#4b5563").pack(anchor="w", pady=(10, 4))
+        progress_bar = ttk.Progressbar(body, mode="determinate", maximum=100)
+
+        state = {"cancel": False, "busy": False}
+
+        def install():
+            if not messagebox.askyesno(
+                "Install update",
+                f"Install version {release.version} now?\n\nStock Tracker will close, update itself and reopen "
+                "in about half a minute. Your stock data is kept, and a backup is made first.",
+                parent=dlg,
+            ):
+                return
+            state["busy"], state["cancel"] = True, False
+            install_button.config(state=tk.DISABLED)
+            close_button.config(text="Cancel")
+            progress_bar.pack(fill=tk.X)
+            messages = queue.Queue()
+            target = os.path.join(updater.download_folder(), release.installer_name)
+
+            def work():
+                try:
+                    messages.put(("status", "Backing up your data..."))
+                    updater.backup_database(self.db_path)
+                    messages.put(("status", "Downloading the update..."))
+                    updater.download(
+                        release.installer_url, target, release.installer_size,
+                        progress=lambda done, total: messages.put(("progress", (done, total))),
+                        cancelled=lambda: state["cancel"],
+                    )
+                    messages.put(("status", "Checking the update's security signature..."))
+                    updater.verify(target, release.version, updater.fetch_signature(release))
+                    messages.put(("done", target))
+                except updater.SignatureError as e:
+                    if os.path.exists(target):
+                        os.remove(target)
+                    messages.put(("security", str(e)))
+                except updater.UpdateError as e:
+                    messages.put(("error", str(e)))
+                except Exception as e:
+                    messages.put(("error", f"Unexpected problem: {e}"))
+
+            threading.Thread(target=work, daemon=True).start()
+
+            def reset_ui():
+                state["busy"] = False
+                install_button.config(state=tk.NORMAL)
+                close_button.config(text="Close")
+                progress_bar.pack_forget()
+
+            def poll():
+                try:
+                    while True:
+                        kind, value = messages.get_nowait()
+                        if kind == "status":
+                            progress_var.set(value)
+                        elif kind == "progress":
+                            done, total = value
+                            if total:
+                                progress_bar["value"] = 100 * done / total
+                                progress_var.set(f"Downloading the update... {done / 1_048_576:.1f} of {total / 1_048_576:.1f} MB")
+                        elif kind == "security":
+                            reset_ui()
+                            progress_var.set("The update was NOT installed.")
+                            messagebox.showerror(
+                                "Update blocked",
+                                f"{value}\n\nThe file was NOT installed and has been deleted. Do not install this update. "
+                                "If this keeps happening, contact whoever supplied Stock Tracker.",
+                                parent=dlg,
+                            )
+                            return
+                        elif kind == "error":
+                            reset_ui()
+                            progress_var.set(value)
+                            if "cancelled" not in value:
+                                messagebox.showwarning("Update", value, parent=dlg)
+                            return
+                        elif kind == "done":
+                            progress_var.set("Installing... Stock Tracker will reopen by itself.")
+                            progress_bar["value"] = 100
+                            dlg.update_idletasks()
+                            self.catalog.log_system_event(
+                                f"Updating Stock Tracker from {app_paths.APP_VERSION} to {release.version}.",
+                                {"from": app_paths.APP_VERSION, "to": release.version},
+                            )
+                            try:
+                                updater.launch_installer(value, relaunch=True)
+                            except OSError as e:
+                                reset_ui()
+                                messagebox.showerror("Update", f"Couldn't start the installer: {e}", parent=dlg)
+                                return
+                            self.stop_connection_polling()
+                            self.root.after(400, self.root.destroy)   # the installer takes over from here
+                            return
+                except queue.Empty:
+                    pass
+                dlg.after(100, poll)
+
+            dlg.after(100, poll)
+
+        def close_or_cancel():
+            if state["busy"]:
+                state["cancel"] = True
+            else:
+                dlg.destroy()
+
+        install_button = make_button(footer, "Install update", install, "primary")
+        install_button.pack(side=tk.RIGHT)
+        if blocker:
+            install_button.config(state=tk.DISABLED)
+        close_button = make_button(footer, "Close", close_or_cancel, "neutral")
+        close_button.pack(side=tk.RIGHT, padx=(0, 10))
+        make_button(footer, "Open release page", lambda: webbrowser.open_new(release.page_url), "neutral").pack(side=tk.LEFT)
+
+        self.theme.style(dlg)
+
     def show_row_menu(self, event):
         """Right-click menu for the stock table."""
         row_id = self.tree.identify_row(event.y)
@@ -1574,7 +2192,7 @@ class StockTrackerApp:
         """Preferences that can be changed after first-run setup."""
         win = tk.Toplevel(self.root)
         win.title("Settings")
-        win.geometry("480x500")
+        win.geometry("480x600")
         win.configure(bg="white")
         win.transient(self.root)
 
@@ -1599,14 +2217,19 @@ class StockTrackerApp:
             self.set_warning_days(int(combo.get().split()[0]))
             win.destroy()
 
-        tk.Label(body, text=f"Stock Tracker version {app_paths.APP_VERSION}", font=(UI_FONT, 9), bg="white", fg="#6b7280").pack(anchor="w", pady=(24, 0))
+        tk.Label(body, text="Updates", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(20, 0))
+        update_status = tk.StringVar(value=f"Installed version: {app_paths.APP_VERSION}")
+        tk.Label(body, textvariable=update_status, font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=420, justify=tk.LEFT).pack(anchor="w", pady=(2, 8))
+        update_button = make_button(body, "Check for updates", lambda: self.check_for_updates(win, update_status, update_button), "neutral")
+        update_button.pack(anchor="w")
 
         make_button(footer, "Save", save, "primary").pack(side=tk.RIGHT)
         make_button(footer, "Cancel", win.destroy, "neutral").pack(side=tk.RIGHT, padx=(0, 10))
         self.theme.style(win)
 
     def show_mobile_setup(self):
-        """Displays a QR code for the mobile app to scan, establishing the Firestore connection."""
+        """Shows the QR codes that connect a phone: one that opens the hosted app, and one that
+        pairs it with this PC's Firestore connection."""
         web_config = self.get_saved_firebase_web_config()
 
         # If no config exists yet, prompt for it
@@ -1626,106 +2249,133 @@ class StockTrackerApp:
 
         qr_window = tk.Toplevel(self.root)
         qr_window.title("Connect Mobile Device")
-        qr_window.geometry("560x820")
+        qr_window.geometry("720x780")
         qr_window.configure(bg="white")
         qr_window.resizable(True, True)
 
         # Keep window on top
         qr_window.attributes('-topmost', True)
 
+        body = tk.Frame(qr_window, bg="white", padx=24, pady=20)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(body, text="Connect Mobile", font=(UI_FONT, 16, "bold"), bg="white", fg="#111827").pack(anchor="w")
         tk.Label(
-            qr_window,
-            text="Connect Mobile",
-            font=(UI_FONT, 14, "bold"),
-            bg="white",
-            fg="#111827",
-        ).pack(pady=(18, 4))
+            body,
+            text="Two quick scans connect a phone: first open the app, then pair it with this PC.",
+            font=(UI_FONT, 10), bg="white", fg="#4b5563",
+        ).pack(anchor="w", pady=(2, 14))
+
+        # -- where the phone page is hosted (needed for the "open the app" QR) --
+        address_frame = tk.Frame(body, bg="#f9fafb", bd=1, relief=tk.SOLID, padx=16, pady=14)
+        address_frame.pack(fill=tk.X)
+        tk.Label(address_frame, text="Phone page address", font=(UI_FONT, 10, "bold"), bg="#f9fafb", fg="#111827").pack(anchor="w")
         tk.Label(
-            qr_window,
-            text="Open the mobile web app, then scan this desktop QR to finish connecting.",
-            font=(UI_FONT, 10),
-            bg="white",
-            fg="#4b5563",
-            wraplength=500,
-            justify=tk.LEFT,
-        ).pack(pady=(0, 10), padx=20, anchor="w")
+            address_frame,
+            text="Where you hosted the phone page, for example https://yourname.github.io/StockTrackerSystem/",
+            font=(UI_FONT, 9), bg="#f9fafb", fg="#6b7280", wraplength=620, justify=tk.LEFT,
+        ).pack(anchor="w", pady=(2, 8))
 
-        instructions_frame = tk.Frame(qr_window, bg="#f9fafb", bd=1, relief=tk.SOLID, padx=16, pady=16)
-        instructions_frame.pack(padx=20, fill=tk.X)
+        address_row = tk.Frame(address_frame, bg="#f9fafb")
+        address_row.pack(fill=tk.X)
+        url_var = tk.StringVar(value=self.get_mobile_app_url())
+        url_status = tk.StringVar()
 
-        tk.Label(instructions_frame, text="Mobile web app steps", font=(UI_FONT, 11, "bold"), bg="#f9fafb", fg="#111827", justify=tk.LEFT).pack(anchor="w")
+        # -- the two QR cards --
+        cards = tk.Frame(body, bg="white")
+        cards.pack(fill=tk.BOTH, expand=True, pady=(16, 0))
+        cards.columnconfigure(0, weight=1, uniform="card")
+        cards.columnconfigure(1, weight=1, uniform="card")
 
-        def add_mobile_step(parent, number, title, detail):
-            step_row = tk.Frame(parent, bg="#f9fafb")
-            step_row.pack(fill=tk.X, anchor="w", pady=(10, 0))
+        def make_card(column, number, title, caption):
+            card = tk.Frame(cards, bg="#f9fafb", bd=1, relief=tk.SOLID, padx=16, pady=14)
+            card.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column == 0 else (8, 0))
 
-            badge = tk.Label(step_row, text=str(number), width=2, height=1, bg="#3b82f6", fg="white", font=(UI_FONT, 10, "bold"))
-            badge.pack(side=tk.LEFT, padx=(0, 10))
+            header = tk.Frame(card, bg="#f9fafb")
+            header.pack(anchor="w")
+            tk.Label(header, text=str(number), width=2, bg="#3b82f6", fg="white", font=(UI_FONT, 10, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+            tk.Label(header, text=title, font=(UI_FONT, 11, "bold"), bg="#f9fafb", fg="#111827").pack(side=tk.LEFT)
+            tk.Label(card, text=caption, font=(UI_FONT, 9), bg="#f9fafb", fg="#4b5563", wraplength=280, justify=tk.LEFT).pack(anchor="w", pady=(8, 10))
 
-            text_block = tk.Frame(step_row, bg="#f9fafb")
-            text_block.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            holder = tk.Frame(card, bg="white", bd=1, relief=tk.SOLID)
+            holder.pack()
+            holder._keep_subtree = True  # QR codes must stay dark-on-white to scan
+            label = tk.Label(holder, bg="white")
+            label.pack(padx=8, pady=8)
+            return card, label
 
-            tk.Label(text_block, text=title, font=(UI_FONT, 9, "bold"), bg="#f9fafb", fg="#111827", anchor="w", justify=tk.LEFT).pack(anchor="w")
-            tk.Label(text_block, text=detail, font=(UI_FONT, 9), bg="#f9fafb", fg="#4b5563", wraplength=460, justify=tk.LEFT).pack(anchor="w", pady=(2, 0))
+        app_card, app_qr_label = make_card(
+            0, 1, "Open the app",
+            "Scan this with your phone's normal camera. It opens the scanner page in your browser.",
+        )
+        pair_card, pair_qr_label = make_card(
+            1, 2, "Pair with this PC",
+            "In the app's \"Scan Desktop QR to Connect\" screen, scan this code.",
+        )
 
-        add_mobile_step(instructions_frame, 1, "Open the mobile scanner app", "Open Stock Tracker in your phone or tablet browser.")
-        add_mobile_step(instructions_frame, 2, "Scan the desktop QR", "In setup mode, scan the code below to connect the mobile app to this Firebase project.")
-        add_mobile_step(instructions_frame, 3, "Start scanning barcodes", "Once connected, the mobile screen should change from setup mode to barcode entry mode.")
+        def show_note(label, text):
+            label.configure(image="", text=text, width=30, height=10, font=(UI_FONT, 9), fg="#4b5563", wraplength=230, justify=tk.CENTER)
+            label.image = None
 
-        fallback_frame = tk.Frame(qr_window, bg="#f9fafb", bd=1, relief=tk.SOLID, padx=16, pady=16)
-        fallback_frame.pack(pady=16, padx=20, fill=tk.X)
-
-        tk.Label(fallback_frame, text="Mobile pairing details", font=(UI_FONT, 11, "bold"), bg="#f9fafb", fg="#111827", wraplength=360, justify=tk.LEFT).pack(anchor="w")
-        tk.Label(fallback_frame, text="Scan the QR code below in the mobile app so it can connect to this desktop session.", font=(UI_FONT, 10), bg="#f9fafb", fg="#4b5563", wraplength=460, justify=tk.LEFT).pack(anchor="w", pady=(8, 12))
-
-        qr_container = tk.Frame(fallback_frame, bg="white", bd=1, relief=tk.SOLID)
-        qr_container.pack(fill=tk.X, pady=(12, 0))
-
-        tk.Label(
-            qr_container,
-            text="Scan this QR code in the mobile app",
-            font=(UI_FONT, 10, "bold"),
-            bg="white",
-            fg="#111827",
-        ).pack(anchor="w", padx=16, pady=(14, 8))
-
-        qr_inner = tk.Frame(qr_container, bg="white")
-        qr_inner.pack(fill=tk.X, padx=16, pady=(0, 14))
-
-        qr_display = tk.Label(qr_inner, bg="white")
-        qr_display.pack(anchor="center")
-
-        if QR_AVAILABLE:
+        def render_qr(label, data, size):
+            if not QR_AVAILABLE:
+                show_note(label, "Install qrcode and pillow to show QR codes.")
+                return
             qrcode = importlib.import_module("qrcode")
             PILImage = importlib.import_module("PIL.Image")
             ImageTk = importlib.import_module("PIL.ImageTk")
 
-            qr_code = qrcode.QRCode(box_size=6, border=2)
-            qr_code.add_data(pairing_payload)
+            qr_code = qrcode.QRCode(box_size=1, border=2)
+            qr_code.add_data(data)
             qr_code.make(fit=True)
-            qr_image = qr_code.make_image(fill_color="black", back_color="white")
-            qr_image = qr_image.convert("RGB").resize((260, 260), PILImage.Resampling.NEAREST)
+            # Whole pixels per square (no fractional scaling), so every module is crisp and equal.
+            qr_code.box_size = max(2, size // (qr_code.modules_count + 4))
+            qr_image = qr_code.make_image(fill_color="black", back_color="white").convert("RGB")
             tk_image = ImageTk.PhotoImage(qr_image)
-            qr_display.configure(image=tk_image)
-            qr_display.image = tk_image
-        else:
-            qr_display.configure(
-                text="Install qrcode and pillow to generate the QR preview.",
-                font=(UI_FONT, 9),
-                fg="#4b5563",
-                justify=tk.LEFT,
-                wraplength=340,
-                padx=8,
-                pady=8,
-            )
+            label.configure(image=tk_image, text="", width=0, height=0)
+            label.image = tk_image
 
-        def copy_payload():
+        def render_app_qr():
+            saved = self.get_mobile_app_url()
+            if saved:
+                render_qr(app_qr_label, saved, 240)
+            else:
+                show_note(app_qr_label, "Enter the phone page address above and click Save to show its QR code.")
+
+        def save_url(_event=None):
+            ok, result = normalize_mobile_url(url_var.get())
+            if not ok:
+                url_status.set(result)
+                return
+            self.save_setting("mobile_app_url", result)
+            url_var.set(result)
+            url_status.set("Saved.")
+            render_app_qr()
+
+        make_button(address_row, "Save", save_url, "primary", padx=16, pady=5).pack(side=tk.RIGHT, padx=(8, 0))
+        url_entry = tk.Entry(address_row, textvariable=url_var, relief=tk.SOLID, bd=1, font=(UI_FONT, 10))
+        url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        url_entry.bind("<Return>", save_url)
+        tk.Label(address_frame, textvariable=url_status, font=(UI_FONT, 9), bg="#f9fafb", fg="#991b1b", wraplength=620, justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
+
+        def copy_text(text, done_message):
             self.root.clipboard_clear()
-            self.root.clipboard_append(pairing_payload)
+            self.root.clipboard_append(text)
             self.root.update()
-            messagebox.showinfo("Copied", "Pairing details copied to clipboard.")
+            messagebox.showinfo("Copied", done_message, parent=qr_window)
 
-        tk.Button(fallback_frame, text="Copy Pairing Details", command=copy_payload, bg="#3b82f6", fg="white", relief=tk.FLAT, padx=10, pady=5).pack(anchor="e", pady=(12, 0))
+        def copy_address():
+            saved = self.get_mobile_app_url()
+            if not saved:
+                messagebox.showwarning("Phone page address", "Enter and save the address first.", parent=qr_window)
+                return
+            copy_text(saved, "Address copied to the clipboard.")
+
+        make_button(app_card, "Copy address", copy_address, "neutral", padx=12, pady=5).pack(pady=(12, 0))
+        make_button(pair_card, "Copy pairing details", lambda: copy_text(pairing_payload, "Pairing details copied to clipboard."), "neutral", padx=12, pady=5).pack(pady=(12, 0))
+
+        render_app_qr()
+        render_qr(pair_qr_label, pairing_payload, 280)
 
         # Option to reset/change the web config
         def reset_config():
@@ -1737,9 +2387,15 @@ class StockTrackerApp:
             qr_window.destroy()
             self.show_mobile_setup()
 
-        tk.Button(qr_window, text="Change Firebase Web Config", command=reset_config, bg="#f3f4f6", relief=tk.FLAT, padx=10, pady=5).pack(pady=5)
+        footer = tk.Frame(body, bg="white")
+        footer.pack(fill=tk.X, pady=(14, 0))
+        make_button(footer, "Change Firebase Web Config", reset_config, "neutral", padx=12, pady=5).pack(side=tk.LEFT)
+        tk.Label(
+            footer,
+            text="The phone remembers its pairing, so you only need this once per phone.",
+            font=(UI_FONT, 9), bg="white", fg="#6b7280",
+        ).pack(side=tk.LEFT, padx=(14, 0))
 
-        qr_container._keep_subtree = True  # QR codes must stay dark-on-white to scan
         self.theme.style(qr_window)
 
 
@@ -1803,7 +2459,47 @@ def run_selftest(report_path):
         finally:
             firebase_admin.delete_app(app)
 
+    def pdf():
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            target = os.path.join(folder, "probe.pdf")
+            sample = [{"id": 1, "product": "Probe", "alias": "1", "item_code": "", "expiry": "2030-01",
+                       "quantity": 1, "status": "good", "month": "2030-01"}]
+            expiry_report.write_pdf(target, expiry_report.build_report(sample, group_by="status"),
+                                    {"title": "Probe", "generated": "now", "lines": [], "footer": "probe"})
+            with open(target, "rb") as f:
+                assert f.read(4) == b"%PDF"
+
+    def history_and_updates():
+        import base64
+        import tempfile
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        with tempfile.TemporaryDirectory() as folder:
+            db = os.path.join(folder, "t.db")
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, barcode TEXT NOT NULL, "
+                         "expiry_date TEXT NOT NULL, quantity INTEGER NOT NULL, last_updated TIMESTAMP)")
+            conn.commit()
+            conn.close()
+            ProductCatalog(db)
+            assert stock_history.count(db) == 0
+            # signature check used by the updater, end to end
+            key = Ed25519PrivateKey.generate()
+            public = base64.b64encode(key.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+            installer = os.path.join(folder, "probe.exe")
+            with open(installer, "wb") as f:
+                f.write(b"probe")
+            signature = base64.b64encode(key.sign(
+                updater.signed_message("9.9.9", updater.sha256_file(installer)))).decode()
+            updater.verify(installer, "9.9.9", signature, public)
+            assert updater.is_newer("1.10.0", "1.9.0")
+            assert app_paths.UPDATE_PUBLIC_KEY and len(base64.b64decode(app_paths.UPDATE_PUBLIC_KEY)) == 32
+
     step("tkinter window", gui)
+    step("stock history + update signature check", history_and_updates)
+    step("PDF export (reportlab)", pdf)
     step("qrcode + Pillow", qr_libs)
     step("Windows key protection", dpapi)
     step("product catalog + sqlite", catalog)
@@ -1837,6 +2533,9 @@ if __name__ == "__main__":
     try:
         app = StockTrackerApp(root)
         root.mainloop()
+    except DatabaseTooNewError as e:
+        messagebox.showerror("Update Stock Tracker", str(e))
+        root.destroy()
     except Exception:
         log_exception(*sys.exc_info())
         messagebox.showerror("Stock Tracker could not start", f"Details were saved to:\n{app_paths.log_path()}")
