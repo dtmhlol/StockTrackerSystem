@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#2563eb">
+    <title>Stock Tracker - Mobile Scanner</title>
+    <script>
+        // Apply the saved (or system) theme before first paint so there's no light flash in dark mode.
+        (function () {
+            try {
+                var saved = localStorage.getItem('STOCK_TRACKER_THEME');
+                var dark = saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+                document.documentElement.classList.toggle('dark', dark);
+            } catch (e) {}
+        })();
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>tailwind.config = { darkMode: 'class' };</script>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+
+    <style type="text/tailwindcss">
+        @layer components {
+            .card { @apply bg-white dark:bg-slate-900 rounded-2xl p-5 shadow-sm ring-1 ring-slate-200/80 dark:ring-slate-800; }
+            .card-title { @apply text-base font-semibold text-slate-900 dark:text-slate-100; }
+            .field-label { @apply block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1.5; }
+            .field { @apply w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2.5 text-base text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500; }
+            .pill { @apply text-center py-2.5 px-2 rounded-xl border border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 transition-colors select-none; }
+            .btn-primary { @apply w-full flex justify-center items-center gap-2 bg-blue-600 hover:bg-blue-700 active:scale-[.98] text-white font-semibold py-3.5 px-4 rounded-xl shadow-md shadow-blue-600/25 transition; }
+            .header-btn { @apply rounded-xl bg-white/15 hover:bg-white/25 active:bg-white/30 text-white transition; }
+        }
+    </style>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
+
+        /* html5-qrcode injects its own UI; restyle it to match the cards */
+        #reader { width: 100%; border: 0 !important; border-radius: 1rem; overflow: hidden; background: rgba(148, 163, 184, 0.12); }
+        #reader__scan_region { background: transparent; }
+        html.dark #reader__scan_region img { filter: invert(1) opacity(0.8); }
+        #reader__header_message { border-radius: 0.5rem; margin: 0.5rem; }
+        #reader__dashboard_section_csr span, #reader__dashboard_section_swaplink, #reader a { color: #475569 !important; font-weight: 500; text-decoration: none; }
+        #reader button {
+            background-color: #2563eb !important; color: #fff !important; border: 0 !important;
+            padding: 0.6rem 1.1rem !important; border-radius: 0.75rem !important; font-weight: 600; margin-top: 0.5rem; cursor: pointer;
+        }
+        #reader select { padding: 0.4rem 0.5rem; border-radius: 0.5rem; border: 1px solid #cbd5e1; background: #fff; color: #0f172a; }
+        html.dark #reader__dashboard_section_csr span, html.dark #reader__dashboard_section_swaplink, html.dark #reader a { color: #cbd5e1 !important; }
+        html.dark #reader select { background: #1e293b; color: #e2e8f0; border-color: #334155; }
+        html.dark #reader__header_message { color: #fca5a5 !important; }
+
+        input[type="month"], input[type="number"] { min-height: 2.75rem; }
+
+        #toast { transition: opacity 0.25s ease, transform 0.25s ease; background: #1e293b; }
+        #toast[data-type="error"] { background: #dc2626; }
+        #toast[data-type="success"] { background: #059669; }
+    </style>
+</head>
+<body class="bg-slate-100 dark:bg-slate-950 text-slate-800 dark:text-slate-100 antialiased">
+
+    <header class="sticky top-0 z-20 bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-lg" style="padding-top: env(safe-area-inset-top)">
+        <div class="max-w-md mx-auto px-4 py-3 flex items-center gap-2.5">
+            <div class="w-9 h-9 rounded-xl bg-white/20 flex items-center justify-center shrink-0">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6v12M8 6v12M12 6v12M16 6v12M20 6v12M6 4v.01M6 20v.01M18 4v.01M18 20v.01"/></svg>
+            </div>
+            <div class="flex-1 min-w-0">
+                <h1 class="text-lg font-bold leading-tight whitespace-nowrap">Stock Tracker</h1>
+                <div id="conn-chip" class="flex items-center gap-1.5 text-xs text-blue-100">
+                    <span id="conn-dot" class="w-2 h-2 rounded-full bg-slate-300"></span>
+                    <span id="conn-text">Not connected</span>
+                </div>
+            </div>
+            <button id="disconnect-btn" type="button" class="hidden header-btn text-xs font-semibold px-2.5 py-2">Disconnect</button>
+            <button id="theme-btn" type="button" aria-label="Toggle dark mode" class="header-btn w-10 h-10 flex items-center justify-center shrink-0">
+                <svg class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path stroke-linecap="round" d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+                <svg class="w-5 h-5 dark:hidden" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
+            </button>
+        </div>
+    </header>
+
+    <main class="max-w-md mx-auto px-4 py-5 space-y-4" style="padding-bottom: calc(6rem + env(safe-area-inset-bottom))">
+
+        <!-- Scanner Section -->
+        <section class="card">
+            <h2 id="scanner-title" class="card-title mb-4">1. Scan Barcode</h2>
+            <div id="reader" class="mb-4"></div>
+            <div id="manual-input-container">
+                <label for="barcode-input" class="field-label">Or enter manually</label>
+                <input type="text" id="barcode-input" placeholder="e.g. 0123456789" autocomplete="off" class="field">
+            </div>
+        </section>
+
+        <!-- Data Entry Section -->
+        <section id="data-entry-section" class="card">
+            <h2 class="card-title mb-4">2. Item Details</h2>
+            <form id="entry-form" class="space-y-5">
+
+                <!-- Action Type -->
+                <div>
+                    <span class="field-label">Action</span>
+                    <div class="grid grid-cols-2 gap-2">
+                        <label class="cursor-pointer">
+                            <input type="radio" name="action" value="ADD" class="peer sr-only" checked>
+                            <div class="pill peer-checked:bg-emerald-50 peer-checked:border-emerald-500 peer-checked:text-emerald-700 dark:peer-checked:bg-emerald-950/60 dark:peer-checked:border-emerald-500 dark:peer-checked:text-emerald-300">
+                                Add to Stock
+                            </div>
+                        </label>
+                        <label class="cursor-pointer">
+                            <input type="radio" name="action" value="REMOVE" class="peer sr-only">
+                            <div class="pill peer-checked:bg-rose-50 peer-checked:border-rose-500 peer-checked:text-rose-700 dark:peer-checked:bg-rose-950/60 dark:peer-checked:border-rose-500 dark:peer-checked:text-rose-300">
+                                Remove (Expired/Damaged)
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Expiry & Qty -->
+                <div class="grid grid-cols-[3fr_2fr] gap-3">
+                    <div>
+                        <label for="expiry-date" class="field-label">Expiry</label>
+                        <input type="month" id="expiry-date" required class="field">
+                    </div>
+                    <div>
+                        <label for="quantity" class="field-label">Quantity</label>
+                        <input type="number" id="quantity" min="1" value="1" required inputmode="numeric" class="field">
+                    </div>
+                </div>
+
+                <!-- Submit Button -->
+                <button type="submit" class="btn-primary">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.9A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+                    Sync to Queue
+                </button>
+            </form>
+        </section>
+
+        <!-- Recent Syncs (Local Session) -->
+        <section class="card">
+            <div class="flex justify-between items-baseline mb-3">
+                <h2 class="card-title">Recent Syncs</h2>
+                <span class="text-xs text-slate-400 dark:text-slate-500">This session only</span>
+            </div>
+            <ul id="sync-log" class="space-y-2 text-sm">
+                <li class="text-slate-500 dark:text-slate-400 italic text-center py-3" id="empty-log-msg">No items synced yet.</li>
+            </ul>
+        </section>
+
+        <!-- Connection diagnostics -->
+        <section id="diag-section" class="card">
+            <details>
+                <summary class="cursor-pointer text-sm font-medium text-slate-500 dark:text-slate-400 select-none">Troubleshooting</summary>
+                <button id="diag-btn" type="button" class="mt-3 w-full rounded-xl border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 font-medium py-2.5 px-4 transition">Run connection test</button>
+                <pre id="diag-output" class="hidden mt-3 text-xs whitespace-pre-wrap break-words bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 ring-1 ring-slate-200 dark:ring-slate-700 rounded-lg p-3"></pre>
+            </details>
+        </section>
+    </main>
+
+    <!-- Notification Toast -->
+    <div id="toast" data-type="info" class="fixed inset-x-4 mx-auto w-fit max-w-full text-white text-sm font-medium px-4 py-3 rounded-xl shadow-xl opacity-0 pointer-events-none z-50 text-center" style="bottom: calc(1.25rem + env(safe-area-inset-bottom))">
+        <span id="toast-message">Action successful</span>
+    </div>
+
+    <script>
+        // DOM Elements
+        const barcodeInput = document.getElementById('barcode-input');
+        const entryForm = document.getElementById('entry-form');
+        const syncLog = document.getElementById('sync-log');
+        const emptyLogMsg = document.getElementById('empty-log-msg');
+        const toast = document.getElementById('toast');
+        const toastMessage = document.getElementById('toast-message');
+
+        // New DOM Elements for Setup Mode
+        const scannerTitle = document.getElementById('scanner-title');
+        const manualInputContainer = document.getElementById('manual-input-container');
+        const dataEntrySection = document.getElementById('data-entry-section');
+        const disconnectBtn = document.getElementById('disconnect-btn');
+
+        // Firebase web config + pairing token, delivered via the desktop app's
+        // setup QR code (see build_pairing_payload in stock_tracker_desktop_app.py).
+        // A Firebase web config's apiKey is not a secret — access is enforced by
+        // Firestore Security Rules, not by hiding this object.
+        let FIREBASE_CONFIG = JSON.parse(localStorage.getItem('FIREBASE_CONFIG') || 'null');
+        let CONNECTION_TOKEN = localStorage.getItem('STOCK_TRACKER_CONNECTION_TOKEN') || "";
+        let isSetupMode = !FIREBASE_CONFIG;
+        let db = null;
+
+        // Initialize Barcode Scanner
+        let html5QrcodeScanner;
+        let heartbeatTimer = null;
+
+        function initFirebase(config) {
+            // Re-pairing with a new config requires tearing down the previous
+            // app first — the compat SDK throws if you initializeApp() twice
+            // under the default app name.
+            if (firebase.apps.length) {
+                firebase.app().delete().catch(() => {});
+            }
+            firebase.initializeApp(config);
+            db = firebase.firestore();
+            // Some networks/browsers block the SDK's default streaming
+            // connection, which makes writes hang silently; this lets it
+            // fall back to long polling.
+            db.settings({ experimentalAutoDetectLongPolling: true, merge: true });
+        }
+
+        // Bypasses the SDK and hits Firestore's REST API directly, so each
+        // failure mode (offline, no database, rules/API-key rejection) shows
+        // up as a distinct, readable result instead of a silent hang.
+        async function runConnectionTest() {
+            const out = document.getElementById('diag-output');
+            out.classList.remove('hidden');
+            const lines = [];
+            const show = () => { out.textContent = lines.join('\n'); };
+
+            lines.push(`Browser reports online: ${navigator.onLine}`);
+            show();
+
+            if (!FIREBASE_CONFIG) {
+                lines.push('Not paired: no Firebase config saved.');
+                show();
+                return;
+            }
+
+            const { projectId, apiKey } = FIREBASE_CONFIG;
+            const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents/presence/${encodeURIComponent(CONNECTION_TOKEN)}?key=${encodeURIComponent(apiKey)}`;
+            lines.push(`Project: ${projectId}`, 'Writing presence doc via REST...');
+            show();
+
+            try {
+                const response = await fetch(url, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ fields: { lastSeen: { timestampValue: new Date().toISOString() } } })
+                });
+                const body = await response.text();
+                lines.push(`HTTP ${response.status}`);
+                if (response.ok) {
+                    lines.push('OK: Firestore is reachable and the rules accepted the write.');
+                } else {
+                    lines.push(body.slice(0, 600));
+                }
+            } catch (error) {
+                lines.push(`Request failed before reaching Google: ${error.message}`);
+                lines.push('Likely no internet, or a network/extension is blocking firestore.googleapis.com.');
+            }
+            show();
+        }
+
+        function isValidFirebaseConfig(value) {
+            return value && typeof value === 'object'
+                && typeof value.apiKey === 'string' && value.apiKey
+                && typeof value.projectId === 'string' && value.projectId
+                && typeof value.token === 'string' && value.token;
+        }
+
+        async function sendHeartbeat() {
+            if (!db || !CONNECTION_TOKEN) {
+                return;
+            }
+
+            try {
+                await db.collection('presence').doc(CONNECTION_TOKEN).set({
+                    lastSeen: firebase.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+            } catch (error) {
+                console.warn('Heartbeat failed:', error);
+            }
+        }
+
+        function startHeartbeat() {
+            stopHeartbeat();
+            sendHeartbeat();
+            heartbeatTimer = setInterval(sendHeartbeat, 30000);
+        }
+
+        function stopHeartbeat() {
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
+        }
+        
+        function updateUIState() {
+            document.getElementById('conn-dot').className = 'w-2 h-2 rounded-full ' + (isSetupMode ? 'bg-slate-300' : 'bg-emerald-300');
+            document.getElementById('conn-text').textContent = isSetupMode ? 'Not connected' : 'Connected';
+
+            if (isSetupMode) {
+                scannerTitle.textContent = "Scan Desktop QR to Connect";
+                manualInputContainer.classList.add('hidden');
+                dataEntrySection.classList.add('hidden');
+                document.getElementById('diag-section').classList.add('hidden');
+                disconnectBtn.classList.add('hidden');
+            } else {
+                scannerTitle.textContent = "1. Scan Barcode";
+                manualInputContainer.classList.remove('hidden');
+                dataEntrySection.classList.remove('hidden');
+                document.getElementById('diag-section').classList.remove('hidden');
+                disconnectBtn.classList.remove('hidden');
+            }
+        }
+        
+        function onScanSuccess(decodedText, decodedResult) {
+            // Stop scanning once we get a result to prevent double scans, user can restart it
+            html5QrcodeScanner.pause(true);
+            
+            if (isSetupMode) {
+                let parsedConfig = null;
+                try {
+                    parsedConfig = JSON.parse(decodedText);
+                } catch (error) {
+                    parsedConfig = null;
+                }
+
+                if (isValidFirebaseConfig(parsedConfig)) {
+                    FIREBASE_CONFIG = parsedConfig;
+                    CONNECTION_TOKEN = parsedConfig.token;
+                    localStorage.setItem('FIREBASE_CONFIG', JSON.stringify(FIREBASE_CONFIG));
+                    localStorage.setItem('STOCK_TRACKER_CONNECTION_TOKEN', CONNECTION_TOKEN);
+                    initFirebase(FIREBASE_CONFIG);
+                    isSetupMode = false;
+                    updateUIState();
+                    startHeartbeat();
+                    showToast('Connected to Firestore.', 'success');
+                    setTimeout(() => html5QrcodeScanner.resume(), 1500);
+                } else {
+                    showToast('Invalid QR Code. Scan the desktop setup QR that contains the connection details.', 'error');
+                    setTimeout(() => html5QrcodeScanner.resume(), 2000);
+                }
+                return;
+            }
+
+            // Populate the input
+            barcodeInput.value = decodedText;
+            
+            // Visual/Audio feedback
+            showToast('Barcode scanned successfully!', 'success');
+            
+            // Optional: Auto-focus the quantity or expiry input after scan
+            document.getElementById('expiry-date').focus();
+        }
+
+        function onScanFailure(error) {
+            // handle scan failure, usually better to ignore and keep scanning
+            // console.warn(`Code scan error = ${error}`);
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            updateUIState();
+
+            // Set up scanner
+            html5QrcodeScanner = new Html5QrcodeScanner(
+                "reader",
+                { fps: 10, qrbox: {width: 250, height: 150}, aspectRatio: 1.0 },
+                /* verbose= */ false
+            );
+            html5QrcodeScanner.render(onScanSuccess, onScanFailure);
+
+            // Set default expiry date to current month
+            const today = new Date();
+            const yyyy = today.getFullYear();
+            const mm = String(today.getMonth() + 1).padStart(2, '0'); // Months are 0-based
+            document.getElementById('expiry-date').value = `${yyyy}-${mm}`;
+
+            // Resume the connection if this device was already paired from a
+            // previous session (page reload, app re-opened, etc.)
+            if (!isSetupMode) {
+                initFirebase(FIREBASE_CONFIG);
+                startHeartbeat();
+            }
+        });
+
+        // Form Submission
+        entryForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            if (isSetupMode) return;
+
+            const barcode = barcodeInput.value.trim();
+            const action = document.querySelector('input[name="action"]:checked').value;
+            const expiry = document.getElementById('expiry-date').value;
+            const quantity = document.getElementById('quantity').value;
+
+            if (!barcode) {
+                showToast('Please scan or enter a barcode.', 'error');
+                return;
+            }
+
+            const payload = {
+                timestamp: new Date().toISOString(),
+                barcode: barcode,
+                action: action,
+                expiry: expiry,
+                quantity: Number(quantity),
+                token: CONNECTION_TOKEN
+            };
+
+            // UI Feedback: Change button state
+            const submitBtn = entryForm.querySelector('button[type="submit"]');
+            const originalBtnHtml = submitBtn.innerHTML;
+            submitBtn.innerHTML = 'Syncing...';
+            submitBtn.disabled = true;
+            submitBtn.classList.add('opacity-75', 'cursor-not-allowed');
+
+            try {
+                // The Firestore SDK queues writes it can't deliver and never
+                // rejects, so without a timeout an unreachable/misconfigured
+                // database looks like an endless "Syncing...". The queued write
+                // may still be delivered later if the connection recovers.
+                await Promise.race([
+                    db.collection('scans').add(payload),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error(
+                        "Couldn't reach Firestore within 10s. Check the internet connection and that the Firestore database is created and its rules published. The entry may still sync later, so don't resubmit until you've checked the desktop."
+                    )), 10000))
+                ]);
+
+                // Success handling
+                logSyncSuccess(payload);
+                sendHeartbeat();
+                showToast(`Successfully queued ${action}: ${barcode}`, 'success');
+                
+                // Reset form partially (keep expiry same as it might be a batch of same items)
+                barcodeInput.value = '';
+                document.getElementById('quantity').value = '1';
+                
+                // Resume scanner if it was paused
+                if(html5QrcodeScanner.getState() === Html5QrcodeScannerState.PAUSED){
+                    html5QrcodeScanner.resume();
+                }
+
+            } catch (error) {
+                console.error("Sync failed:", error);
+                showToast(`Failed to sync: ${error.message}`, 'error');
+            } finally {
+                // Reset button
+                submitBtn.innerHTML = originalBtnHtml;
+                submitBtn.disabled = false;
+                submitBtn.classList.remove('opacity-75', 'cursor-not-allowed');
+            }
+        });
+
+        // Update Local Log UI
+        function logSyncSuccess(data) {
+            if (emptyLogMsg) {
+                emptyLogMsg.remove();
+            }
+
+            const li = document.createElement('li');
+            li.className = "flex justify-between items-center gap-3 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 ring-1 ring-slate-200/70 dark:ring-slate-700/60";
+
+            const actionColor = data.action === 'ADD'
+                ? 'text-emerald-600 dark:text-emerald-400'
+                : 'text-rose-600 dark:text-rose-400';
+
+            // Built with textContent (not innerHTML): the barcode comes from a
+            // scanned code or typed text and must never be parsed as markup.
+            const left = document.createElement('div');
+            left.className = 'min-w-0';
+            const code = document.createElement('div');
+            code.className = 'font-mono font-medium text-slate-800 dark:text-slate-100 truncate';
+            code.textContent = data.barcode;
+            const expiry = document.createElement('div');
+            expiry.className = 'text-xs text-slate-500 dark:text-slate-400';
+            expiry.textContent = `Exp ${data.expiry}`;
+            left.append(code, expiry);
+
+            const right = document.createElement('div');
+            right.className = 'text-right shrink-0';
+            const action = document.createElement('span');
+            action.className = `font-bold ${actionColor}`;
+            action.textContent = data.action;
+            const qty = document.createElement('span');
+            qty.className = 'text-sm text-slate-600 dark:text-slate-300 ml-1';
+            qty.textContent = `x${data.quantity}`;
+            right.append(action, qty);
+
+            li.append(left, right);
+
+            // Add to top of list
+            syncLog.prepend(li);
+        }
+
+        // Toast Notification System
+        let toastTimeout;
+        function showToast(message, type = 'info') {
+            toastMessage.textContent = message;
+            toast.dataset.type = type; // colours come from the #toast[data-type] rules in the stylesheet
+
+            toast.classList.remove('opacity-0', 'pointer-events-none');
+            toast.classList.add('opacity-100');
+
+            // Errors carry instructions, so give them longer to be read.
+            clearTimeout(toastTimeout);
+            toastTimeout = setTimeout(() => {
+                toast.classList.remove('opacity-100');
+                toast.classList.add('opacity-0', 'pointer-events-none');
+            }, type === 'error' ? 6000 : 3000);
+        }
+        
+        document.getElementById('diag-btn').addEventListener('click', runConnectionTest);
+
+        document.getElementById('theme-btn').addEventListener('click', () => {
+            const dark = document.documentElement.classList.toggle('dark');
+            try {
+                localStorage.setItem('STOCK_TRACKER_THEME', dark ? 'dark' : 'light');
+            } catch (e) {}
+            document.querySelector('meta[name="theme-color"]').content = dark ? '#1e3a8a' : '#2563eb';
+        });
+
+        // Handle Disconnect
+        disconnectBtn.addEventListener('click', () => {
+            if(confirm("Are you sure you want to disconnect this device?")) {
+                stopHeartbeat();
+                localStorage.removeItem('FIREBASE_CONFIG');
+                localStorage.removeItem('STOCK_TRACKER_CONNECTION_TOKEN');
+                if (firebase.apps.length) {
+                    firebase.app().delete().catch(() => {});
+                }
+                db = null;
+                FIREBASE_CONFIG = null;
+                CONNECTION_TOKEN = "";
+                isSetupMode = true;
+                updateUIState();
+                showToast("Device disconnected.", "info");
+            }
+        });
+    </script>
+</body>
+</html>
