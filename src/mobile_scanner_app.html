@@ -17,7 +17,14 @@
     </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>tailwind.config = { darkMode: 'class' };</script>
-    <script src="https://unpkg.com/html5-qrcode"></script>
+    <!-- Pinned so a new library release can't change scanner behaviour unexpectedly.
+         Loaded from jsDelivr, with unpkg as a synchronous fallback if that fails. -->
+    <script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script>
+        if (typeof Html5Qrcode === 'undefined') {
+            document.write('<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"><\/script>');
+        }
+    </script>
     <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 
@@ -28,27 +35,17 @@
             .field-label { @apply block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1.5; }
             .field { @apply w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2.5 text-base text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500; }
             .pill { @apply text-center py-2.5 px-2 rounded-xl border border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 transition-colors select-none; }
-            .btn-primary { @apply w-full flex justify-center items-center gap-2 bg-blue-600 hover:bg-blue-700 active:scale-[.98] text-white font-semibold py-3.5 px-4 rounded-xl shadow-md shadow-blue-600/25 transition; }
+            .btn-primary { @apply w-full flex justify-center items-center gap-2 bg-blue-600 hover:bg-blue-700 active:scale-[.98] text-white font-semibold py-3.5 px-4 rounded-xl shadow-md shadow-blue-600/25 transition disabled:opacity-60; }
+            .btn-secondary { @apply w-full flex justify-center items-center gap-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 active:scale-[.98] text-slate-700 dark:text-slate-200 font-semibold py-3.5 px-4 transition disabled:opacity-60; }
             .header-btn { @apply rounded-xl bg-white/15 hover:bg-white/25 active:bg-white/30 text-white transition; }
         }
     </style>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
 
-        /* html5-qrcode injects its own UI; restyle it to match the cards */
-        #reader { width: 100%; border: 0 !important; border-radius: 1rem; overflow: hidden; background: rgba(148, 163, 184, 0.12); }
-        #reader__scan_region { background: transparent; }
-        html.dark #reader__scan_region img { filter: invert(1) opacity(0.8); }
-        #reader__header_message { border-radius: 0.5rem; margin: 0.5rem; }
-        #reader__dashboard_section_csr span, #reader__dashboard_section_swaplink, #reader a { color: #475569 !important; font-weight: 500; text-decoration: none; }
-        #reader button {
-            background-color: #2563eb !important; color: #fff !important; border: 0 !important;
-            padding: 0.6rem 1.1rem !important; border-radius: 0.75rem !important; font-weight: 600; margin-top: 0.5rem; cursor: pointer;
-        }
-        #reader select { padding: 0.4rem 0.5rem; border-radius: 0.5rem; border: 1px solid #cbd5e1; background: #fff; color: #0f172a; }
-        html.dark #reader__dashboard_section_csr span, html.dark #reader__dashboard_section_swaplink, html.dark #reader a { color: #cbd5e1 !important; }
-        html.dark #reader select { background: #1e293b; color: #e2e8f0; border-color: #334155; }
-        html.dark #reader__header_message { color: #fca5a5 !important; }
+        /* html5-qrcode renders the camera video and scan-box shading inside #reader */
+        #reader { width: 100%; border-radius: 1rem; overflow: hidden; background: #000; }
+        #reader video { display: block; }
 
         input[type="month"], input[type="number"] { min-height: 2.75rem; }
 
@@ -84,7 +81,21 @@
         <!-- Scanner Section -->
         <section class="card">
             <h2 id="scanner-title" class="card-title mb-4">1. Scan Barcode</h2>
-            <div id="reader" class="mb-4"></div>
+
+            <!-- Shown while the camera is off -->
+            <div id="camera-placeholder" class="mb-3 aspect-square rounded-2xl bg-slate-100 dark:bg-slate-800/70 ring-1 ring-slate-200 dark:ring-slate-700 flex flex-col items-center justify-center gap-3 text-center p-6">
+                <svg class="w-12 h-12 text-slate-400 dark:text-slate-500" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 8.5A2.5 2.5 0 015.5 6h1.6l1.2-1.8A1.5 1.5 0 019.55 3.5h4.9a1.5 1.5 0 011.25.7L16.9 6h1.6A2.5 2.5 0 0121 8.5v9a2.5 2.5 0 01-2.5 2.5h-13A2.5 2.5 0 013 17.5v-9z"/><circle cx="12" cy="12.5" r="3.5"/></svg>
+                <p id="camera-status" class="text-sm text-slate-500 dark:text-slate-400 max-w-[18rem]"></p>
+            </div>
+            <div id="reader" class="mb-3 hidden"></div>
+
+            <div class="flex gap-2 mb-4">
+                <button id="camera-btn" type="button" class="btn-primary">Start camera</button>
+                <button id="switch-camera-btn" type="button" aria-label="Switch camera" title="Switch camera" class="hidden btn-secondary !w-auto shrink-0 !px-4">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7h11a4 4 0 014 4v1M20 17H9a4 4 0 01-4-4v-1M17 9l2 3 2-3M7 15l-2-3-2 3"/></svg>
+                </button>
+            </div>
+
             <div id="manual-input-container">
                 <label for="barcode-input" class="field-label">Or enter manually</label>
                 <input type="text" id="barcode-input" placeholder="e.g. 0123456789" autocomplete="off" class="field">
@@ -176,6 +187,13 @@
         const dataEntrySection = document.getElementById('data-entry-section');
         const disconnectBtn = document.getElementById('disconnect-btn');
 
+        // Camera controls
+        const readerEl = document.getElementById('reader');
+        const cameraPlaceholder = document.getElementById('camera-placeholder');
+        const cameraStatus = document.getElementById('camera-status');
+        const cameraBtn = document.getElementById('camera-btn');
+        const switchCameraBtn = document.getElementById('switch-camera-btn');
+
         // Firebase web config + pairing token, delivered via the desktop app's
         // setup QR code (see build_pairing_payload in pc_backend_automation_service.py).
         // A Firebase web config's apiKey is not a secret — access is enforced by
@@ -185,10 +203,266 @@
         let isSetupMode = !FIREBASE_CONFIG;
         let db = null;
 
-        // Initialize Barcode Scanner
-        let html5QrcodeScanner;
         let heartbeatTimer = null;
 
+        // ---------------------------------------------------------------
+        // Camera / scanner
+        //
+        // Uses the low-level Html5Qrcode class instead of the Html5QrcodeScanner
+        // widget. The widget lists cameras before starting, which on iOS needs
+        // permission already granted (so users get an extra button, an empty
+        // or unlabeled dropdown, and sometimes the front camera). Starting
+        // straight from a tap with facingMode "environment" gives one prompt and
+        // the rear camera on iOS, Android and desktop (desktop falls back to
+        // its only webcam).
+        // ---------------------------------------------------------------
+        const SCANNER_STATE = window.Html5QrcodeScannerState || { NOT_STARTED: 1, SCANNING: 2, PAUSED: 3 };
+        const CAMERA_PREF_KEY = 'STOCK_TRACKER_CAMERA_ID';
+
+        let scanner = null;
+        let cameras = [];            // filled after the first successful start (labels need permission)
+        let currentCameraId = null;
+        let cameraWanted = false;    // the user wants the camera on; used to restart it after backgrounding
+        let cameraBusy = false;
+
+        function scannerState() {
+            try {
+                return scanner ? scanner.getState() : SCANNER_STATE.NOT_STARTED;
+            } catch (e) {
+                return SCANNER_STATE.NOT_STARTED;
+            }
+        }
+
+        function cameraRunning() {
+            const state = scannerState();
+            return state === SCANNER_STATE.SCANNING || state === SCANNER_STATE.PAUSED;
+        }
+
+        const LIBRARY_MISSING_MESSAGE = "The barcode scanner couldn't load. Check the internet connection (or any content blocker) and reload the page. You can still type barcodes manually.";
+
+        // Creates the scanner the first time it's needed. Returns null if the
+        // html5-qrcode library failed to load, instead of crashing the page.
+        function ensureScanner() {
+            if (scanner) return scanner;
+            if (typeof Html5Qrcode === 'undefined') return null;
+            scanner = new Html5Qrcode("reader", /* verbose= */ false);
+            return scanner;
+        }
+
+        // The pairing QR holds a whole Firebase config, so it's a dense square
+        // code: use a large square box. Product barcodes are wide and short.
+        function squareBox(viewWidth, viewHeight) {
+            const size = Math.max(50, Math.floor(Math.min(viewWidth, viewHeight) * 0.75));
+            return { width: size, height: size };
+        }
+
+        function wideBox(viewWidth, viewHeight) {
+            const width = Math.max(50, Math.floor(Math.min(viewWidth * 0.9, 360)));
+            const height = Math.max(50, Math.floor(Math.min(viewHeight * 0.6, width * 0.55)));
+            return { width, height };
+        }
+
+        function scanConfig() {
+            return { fps: 10, aspectRatio: 1.0, qrbox: isSetupMode ? squareBox : wideBox };
+        }
+
+        function defaultCameraHint() {
+            return isSetupMode
+                ? 'Tap Start camera, then point it at the setup QR code on the desktop app.'
+                : 'Tap Start camera to scan barcodes.';
+        }
+
+        function setCameraStatus(message, isError) {
+            cameraStatus.textContent = message || defaultCameraHint();
+            cameraStatus.className = 'text-sm max-w-[18rem] ' + (isError
+                ? 'text-rose-600 dark:text-rose-400 font-medium'
+                : 'text-slate-500 dark:text-slate-400');
+        }
+
+        function renderCameraControls() {
+            const running = cameraRunning();
+            const paused = scannerState() === SCANNER_STATE.PAUSED;
+            const showVideo = running || cameraBusy;
+
+            readerEl.classList.toggle('hidden', !showVideo);
+            cameraPlaceholder.classList.toggle('hidden', showVideo);
+
+            cameraBtn.disabled = cameraBusy;
+            cameraBtn.textContent = cameraBusy ? 'Starting camera…'
+                : paused ? 'Scan again'
+                : running ? 'Stop camera'
+                : 'Start camera';
+            cameraBtn.className = (running && !paused) ? 'btn-secondary' : 'btn-primary';
+
+            switchCameraBtn.classList.toggle('hidden', !(running && cameras.length > 1));
+            switchCameraBtn.disabled = cameraBusy;
+        }
+
+        function describeCameraError(error) {
+            const text = error && typeof error === 'object'
+                ? `${error.name || ''} ${error.message || ''}`.trim()
+                : String(error);
+
+            if (/NotAllowed|Permission|denied/i.test(text)) {
+                return 'Camera access was blocked. On iPhone, turn on Camera for this browser in the iOS Settings app (Settings → Chrome or Safari → Camera). On other devices, allow the camera in this site\'s settings. Then tap Start camera.';
+            }
+            if (/NotFound|not found|no camera/i.test(text)) {
+                return 'No camera was found on this device.';
+            }
+            if (/NotReadable|TrackStart|in use|Could not start/i.test(text)) {
+                return 'The camera is being used by another app. Close it and tap Start camera again.';
+            }
+            if (/secure|https/i.test(text)) {
+                return 'The camera only works when this page is opened over https.';
+            }
+            return `Couldn't start the camera: ${text}`;
+        }
+
+        async function startCamera(deviceId) {
+            if (cameraBusy) return;
+            if (!ensureScanner()) {
+                setCameraStatus(LIBRARY_MISSING_MESSAGE, true);
+                renderCameraControls();
+                return;
+            }
+            cameraBusy = true;
+            setCameraStatus('');
+            renderCameraControls();
+
+            if (deviceId === undefined) {
+                deviceId = localStorage.getItem(CAMERA_PREF_KEY) || null;
+            }
+
+            try {
+                if (cameraRunning()) {
+                    await scanner.stop();
+                }
+
+                try {
+                    await scanner.start(deviceId || { facingMode: 'environment' }, scanConfig(), onScanSuccess, onScanFailure);
+                } catch (error) {
+                    // A saved camera ID can go stale (some browsers change IDs
+                    // between sessions). Forget it and fall back to the rear camera.
+                    if (!deviceId) throw error;
+                    localStorage.removeItem(CAMERA_PREF_KEY);
+                    deviceId = null;
+                    await scanner.start({ facingMode: 'environment' }, scanConfig(), onScanSuccess, onScanFailure);
+                }
+
+                cameraWanted = true;
+                try {
+                    currentCameraId = scanner.getRunningTrackSettings().deviceId || deviceId;
+                } catch (e) {
+                    currentCameraId = deviceId;
+                }
+
+                // Camera names are only available once permission is granted.
+                if (!cameras.length) {
+                    try {
+                        cameras = await Html5Qrcode.getCameras();
+                    } catch (e) {
+                        cameras = [];
+                    }
+                }
+            } catch (error) {
+                console.error('Camera start failed:', error);
+                cameraWanted = false;
+                setCameraStatus(describeCameraError(error), true);
+            } finally {
+                cameraBusy = false;
+                renderCameraControls();
+            }
+        }
+
+        async function stopCamera() {
+            if (cameraRunning()) {
+                try {
+                    await scanner.stop();
+                } catch (error) {
+                    console.warn('Camera stop failed:', error);
+                }
+            }
+            renderCameraControls();
+        }
+
+        async function switchCamera() {
+            if (cameraBusy || cameras.length < 2) return;
+            const currentIndex = cameras.findIndex(camera => camera.id === currentCameraId);
+            const nextIndex = (currentIndex + 1) % cameras.length;
+            const next = cameras[nextIndex];
+
+            localStorage.setItem(CAMERA_PREF_KEY, next.id);
+            await startCamera(next.id);
+            if (cameraRunning()) {
+                showToast(next.label ? `Camera: ${next.label}` : `Camera ${nextIndex + 1} of ${cameras.length}`, 'info');
+            }
+        }
+
+        function pauseScanning() {
+            if (scannerState() === SCANNER_STATE.SCANNING) {
+                try {
+                    scanner.pause(true);
+                } catch (e) {}
+            }
+            renderCameraControls();
+        }
+
+        function resumeScanning() {
+            if (scannerState() === SCANNER_STATE.PAUSED) {
+                try {
+                    scanner.resume();
+                } catch (e) {}
+            }
+            renderCameraControls();
+        }
+
+        // On Android and desktop the browser remembers camera permission, so
+        // start straight away. Chrome on iOS doesn't remember it between visits,
+        // so there the user taps Start camera (iOS is most reliable when the
+        // request comes directly from a tap).
+        async function autoStartIfAllowed() {
+            try {
+                if (!navigator.permissions || !navigator.permissions.query) return;
+                const status = await navigator.permissions.query({ name: 'camera' });
+                if (status.state === 'granted') {
+                    startCamera();
+                }
+            } catch (e) {
+                // Some browsers don't support querying camera permission.
+            }
+        }
+
+        cameraBtn.addEventListener('click', () => {
+            if (cameraBusy) return;
+            const state = scannerState();
+            if (state === SCANNER_STATE.PAUSED) {
+                resumeScanning();
+            } else if (state === SCANNER_STATE.SCANNING) {
+                cameraWanted = false;
+                stopCamera();
+            } else {
+                startCamera();
+            }
+        });
+
+        switchCameraBtn.addEventListener('click', switchCamera);
+
+        // Phones stop the camera when the app is backgrounded or the screen
+        // locks. Stop cleanly when hidden and restart when visible again.
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                if (cameraRunning()) stopCamera();
+            } else if (cameraWanted && !cameraRunning()) {
+                startCamera();
+            }
+        });
+        window.addEventListener('pagehide', () => {
+            if (cameraRunning()) stopCamera();
+        });
+
+        // ---------------------------------------------------------------
+        // Firebase
+        // ---------------------------------------------------------------
         function initFirebase(config) {
             // Re-pairing with a new config requires tearing down the previous
             // app first — the compat SDK throws if you initializeApp() twice
@@ -298,11 +572,16 @@
                 document.getElementById('diag-section').classList.remove('hidden');
                 disconnectBtn.classList.remove('hidden');
             }
+
+            setCameraStatus('');
         }
         
         function onScanSuccess(decodedText, decodedResult) {
-            // Stop scanning once we get a result to prevent double scans, user can restart it
-            html5QrcodeScanner.pause(true);
+            // Ignore extra frames decoded after we've already paused.
+            if (scannerState() !== SCANNER_STATE.SCANNING) return;
+
+            // Pause once we get a result to prevent double scans; "Scan again" or a sync resumes it.
+            pauseScanning();
             
             if (isSetupMode) {
                 let parsedConfig = null;
@@ -322,10 +601,11 @@
                     updateUIState();
                     startHeartbeat();
                     showToast('Connected to Firestore.', 'success');
-                    setTimeout(() => html5QrcodeScanner.resume(), 1500);
+                    // Restart with the wide barcode scan box.
+                    setTimeout(() => startCamera(), 1500);
                 } else {
                     showToast('Invalid QR Code. Scan the desktop setup QR that contains the connection details.', 'error');
-                    setTimeout(() => html5QrcodeScanner.resume(), 2000);
+                    setTimeout(resumeScanning, 2000);
                 }
                 return;
             }
@@ -341,20 +621,20 @@
         }
 
         function onScanFailure(error) {
-            // handle scan failure, usually better to ignore and keep scanning
-            // console.warn(`Code scan error = ${error}`);
+            // Called for every frame without a code; ignore and keep scanning.
         }
 
         document.addEventListener('DOMContentLoaded', () => {
             updateUIState();
 
-            // Set up scanner
-            html5QrcodeScanner = new Html5QrcodeScanner(
-                "reader",
-                { fps: 10, qrbox: {width: 250, height: 150}, aspectRatio: 1.0 },
-                /* verbose= */ false
-            );
-            html5QrcodeScanner.render(onScanSuccess, onScanFailure);
+            // Set up scanner (the camera starts on tap, or automatically if
+            // permission is already granted).
+            if (ensureScanner()) {
+                autoStartIfAllowed();
+            } else {
+                setCameraStatus(LIBRARY_MISSING_MESSAGE, true);
+            }
+            renderCameraControls();
 
             // Set default expiry date to current month
             const today = new Date();
@@ -424,9 +704,7 @@
                 document.getElementById('quantity').value = '1';
                 
                 // Resume scanner if it was paused
-                if(html5QrcodeScanner.getState() === Html5QrcodeScannerState.PAUSED){
-                    html5QrcodeScanner.resume();
-                }
+                resumeScanning();
 
             } catch (error) {
                 console.error("Sync failed:", error);
@@ -521,6 +799,8 @@
                 CONNECTION_TOKEN = "";
                 isSetupMode = true;
                 updateUIState();
+                // Restart with the square scan box for the pairing QR.
+                if (cameraRunning()) startCamera();
                 showToast("Device disconnected.", "info");
             }
         });
