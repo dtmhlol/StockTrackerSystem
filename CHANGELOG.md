@@ -3,6 +3,24 @@
 All notable changes to Stock Tracker. Each release's section is used as its GitHub release notes,
 which the in-app updater shows before installing. Newest first.
 
+## [1.1.2] - 2026-09-26
+
+### Added
+- **Add Item.** A new **＋ Add Item** button (or Ctrl+N) records stock by hand, for example an item found on a shelf that is close to expiring. Type or scan the barcode or item code and the catalog fills in the product name. Choose the expiry month (2027-03 or 03/2027 both work; the window shows whether it counts as expired or expiring soon), and the quantity. It behaves like a phone scan: an existing row for the same product and expiry goes up. Codes the catalog doesn't know can be added with a name (a new product) or without one (an unnamed product). If a code matches several products you choose which. Tick "Keep this window open" to add several items in a row. Each one appears in History as **Manual add**.
+- **Replace or reset the product catalog** (⚙ Settings → Product catalog). **Replace from file...** makes a CSV the whole catalog, with the usual column choice and a preview of exactly what will change. **Reset catalog...** clears every product. Stock on hand is always kept: it stays under its barcode as an unnamed product and is matched to the new catalog by barcode the next time products are imported or replaced. A safety backup is saved first (in the `backups` folder next to the database), both need a confirmation (Reset asks you to type RESET), both are recorded in History, and both can be undone from the Products window until stock next changes.
+
+### Changed
+- **Undo last import** is now **Undo last change**, because it also undoes a replace or reset.
+- The dashboard's **Add Item**, **Remove Selected** and **Refresh** buttons now sit in their own row above the stock table.
+- History has two new event types you can filter on: **Manual add** and **Catalog reset / replaced**.
+
+### Fixed
+- **Buttons cut off on small screens.** On a short screen, the buttons at the bottom of some windows (for example **Preview changes / Cancel / Import** when importing a product list) ran off the bottom edge and couldn't be clicked. Every window now fits the space above the taskbar, and its buttons are pinned to the bottom edge so they always show. If the content is taller than the screen, the content scrolls (scrollbar or mouse wheel) while the buttons stay in place. This applies to Import and Replace, Add Item, Edit, Export, Settings, Connect Mobile, Pending scans, the Products window, History, Update and Setup. Windows also open centred over the main window and never partly off the screen.
+- On some screens the **Remove Selected** and **Refresh** buttons were pushed off the right edge of the toolbar and couldn't be seen. The window now never becomes narrower than its buttons need.
+
+### Upgrading from 1.1.0
+Use **Settings → Check for updates**. Your data is kept, and the database format is unchanged.
+
 ## [1.1.0] - 2026-09-25
 
 ### Added

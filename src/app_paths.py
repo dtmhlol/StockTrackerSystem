@@ -8,7 +8,7 @@ wiped on upgrade/uninstall, so data lives in %LOCALAPPDATA%\\StockTracker instea
 import os
 import sys
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.2"
 
 # Updates come from this repository's GitHub Releases.
 GITHUB_REPO = "dtmhlol/StockTrackerSystem"

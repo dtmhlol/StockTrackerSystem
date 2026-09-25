@@ -47,6 +47,25 @@ def _now():
     return datetime.now().isoformat(timespec="seconds")
 
 
+_EXPIRY_TEXT = re.compile(r"^(?:(\d{4})[-/](\d{1,2})|(\d{1,2})[-/](\d{4}))$")
+
+
+def expiry_from_text(text):
+    """Turns what a person typed into the stored YYYY-MM form. Accepts 2027-03, 2027/3, 03/2027
+    and 3-2027. Raises ValueError with a readable message for anything else, or for a year
+    outside 2000-2099 (almost always a typo)."""
+    match = _EXPIRY_TEXT.match(str(text or "").strip())
+    if not match:
+        raise ValueError("Expiry must be a month and year, for example 2027-03 or 03/2027.")
+    year, month = (match.group(1), match.group(2)) if match.group(1) else (match.group(4), match.group(3))
+    year, month = int(year), int(month)
+    if not 1 <= month <= 12:
+        raise ValueError("The month must be between 1 and 12.")
+    if not 2000 <= year <= 2099:
+        raise ValueError("The year must be between 2000 and 2099.")
+    return f"{year:04d}-{month:02d}"
+
+
 def looks_like_scientific_notation(value):
     return bool(_SCI_NOTATION.match(str(value or "").strip()))
 
@@ -445,7 +464,7 @@ class ProductCatalog:
         return cursor.lastrowid
 
     def _apply_delta(self, conn, sys_key, barcode, action, expiry, quantity,
-                     source="phone", scanned_at=None, note=""):
+                     source="phone", scanned_at=None, note="", event=None, details=None):
         delta = quantity if action == "ADD" else -quantity
         existing = conn.execute(
             "SELECT quantity FROM inventory WHERE sys_key = ? AND expiry_date = ?", (sys_key, expiry)
@@ -466,9 +485,9 @@ class ProductCatalog:
         if wanted < 0:
             note = (note + " " if note else "") + f"Removal exceeded stock by {-wanted}."
         stock_history.record(
-            conn, "SCAN_ADD" if action == "ADD" else "SCAN_REMOVE", source, sys_key=sys_key,
+            conn, event or ("SCAN_ADD" if action == "ADD" else "SCAN_REMOVE"), source, sys_key=sys_key,
             raw_code=barcode, expiry=expiry, delta=after - before, before=before, after=after,
-            scanned_at=scanned_at, note=note,
+            scanned_at=scanned_at, note=note, details=details,
         )
 
     def apply_scan(self, conn, barcode, action, expiry, quantity, scanned_at=None):
@@ -650,6 +669,131 @@ class ProductCatalog:
         finally:
             conn.close()
 
+    # -- manual add --------------------------------------------------------
+
+    def stock_quantity(self, sys_key, expiry):
+        """Units on hand for one product and expiry month (0 if there's no such row)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT quantity FROM inventory WHERE sys_key = ? AND expiry_date = ?", (sys_key, expiry)
+            ).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else 0
+
+    def stock_row_id(self, sys_key, expiry):
+        """The inventory row id for one product and expiry month, or None."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT id FROM inventory WHERE sys_key = ? AND expiry_date = ?", (sys_key, expiry)
+            ).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+
+    def add_stock_item(self, code, quantity, expiry, description="", sys_key=None, dry_run=False):
+        """Adds stock by hand, exactly as if the phone had scanned it (same product matching,
+        and it adds to an existing row for the same product and expiry), but logged as a
+        manual add. `code` is an alias/barcode or item code.
+
+        - Known code: the catalog's product is used. If that product is unnamed and a name is
+          given, the name is saved and the product becomes a real one.
+        - Unknown code with a name: a new named product is created (alias = the code).
+        - Unknown code without a name: recorded under an unnamed product, like an unknown scan.
+        - Code matching several products: pass `sys_key` to say which one (ValueError if not).
+
+        Raises ValueError with a user-readable message and changes nothing if anything is
+        invalid. dry_run=True runs every check and rolls back. Returns a dict describing the
+        result: sys_key, product, expiry, added, before, after, created_product, named_product."""
+        code = str(code or "").strip()
+        description = str(description or "").strip()
+        expiry = expiry_from_text(expiry)
+        try:
+            quantity = int(str(quantity).strip())
+        except ValueError:
+            raise ValueError("Quantity must be a whole number.")
+        if quantity < 1:
+            raise ValueError("Quantity must be at least 1.")
+        if looks_like_scientific_notation(code):
+            raise ValueError(
+                "That code looks like a number Excel has shortened (scientific notation). Enter the full digits."
+            )
+        if not normalize_identifier(code):
+            raise ValueError("Enter the item's barcode or item code.")
+
+        candidates = self.resolve(code)
+        if sys_key is not None and sys_key not in candidates:
+            raise ValueError("That product doesn't match the code entered.")
+        if sys_key is None and len(candidates) > 1:
+            raise ValueError("This code matches several products. Choose which one it is.")
+        if sys_key is None and candidates:
+            sys_key = candidates[0]
+
+        conn = self._connect()
+        created_product = named_product = False
+        reload_needed = True
+        try:
+            if sys_key is None:
+                if description:
+                    now = _now()
+                    key = normalize_identifier(code)
+                    cursor = conn.execute(
+                        "INSERT INTO products (item_code, alias, code_key, alias_key, description, "
+                        "is_placeholder, created_at, updated_at) VALUES ('', ?, '', ?, ?, 0, ?, ?)",
+                        (code, key, description, now, now),
+                    )
+                    sys_key = cursor.lastrowid
+                else:
+                    sys_key = self._get_or_create_placeholder(conn, code)
+                created_product = True
+            else:
+                found = conn.execute(
+                    "SELECT description, is_placeholder FROM products WHERE sys_key = ?", (sys_key,)
+                ).fetchone()
+                if not found:
+                    raise ValueError("That product no longer exists.")
+                if found[1] and description:
+                    conn.execute(
+                        "UPDATE products SET description = ?, is_placeholder = 0, updated_at = ? WHERE sys_key = ?",
+                        (description, _now(), sys_key),
+                    )
+                    named_product = True
+
+            row = conn.execute(
+                "SELECT quantity FROM inventory WHERE sys_key = ? AND expiry_date = ?", (sys_key, expiry)
+            ).fetchone()
+            before = row[0] if row else 0
+            self._apply_delta(
+                conn, sys_key, code, "ADD", expiry, quantity, "desktop", None, "Added by hand.",
+                event="MANUAL_ADD",
+                details={"created_product": created_product, "named_product": named_product} if (created_product or named_product) else None,
+            )
+            product_name = conn.execute(
+                "SELECT description FROM products WHERE sys_key = ?", (sys_key,)
+            ).fetchone()[0]
+
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+                reload_needed = created_product or named_product
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+            # A rolled-back attempt may have left a placeholder in the in-memory index.
+            if reload_needed:
+                self.reload_index()
+
+        return {
+            "sys_key": sys_key, "product": product_name or PLACEHOLDER_LABEL, "expiry": expiry,
+            "added": quantity, "before": before, "after": before + quantity,
+            "created_product": created_product, "named_product": named_product,
+        }
+
     # -- manual edits ------------------------------------------------------
 
     def get_stock_row(self, inventory_id):
@@ -822,18 +966,29 @@ class ProductCatalog:
 
     # -- import / undo -----------------------------------------------------
 
-    def import_records(self, records, parse_stats, filename, dry_run=False):
+    def import_records(self, records, parse_stats, filename, dry_run=False, replace=False):
         """Applies parsed records to the catalog. With dry_run=True the exact
         same code runs and is then rolled back, so the preview can never
-        disagree with what the real import does."""
+        disagree with what the real import does. With replace=True the existing
+        catalog is cleared first (see reset_catalog) and the file becomes the
+        whole catalog, all in one transaction: a failure leaves everything as it was."""
+        if replace and not records:
+            raise ValueError(
+                "This file has no usable products, so replacing the catalog with it would just empty it. "
+                "Use Reset instead if that is what you want."
+            )
         conn = self._connect()
         try:
             if not dry_run:
                 self._snapshot(conn)
 
+            reset = self._reset_catalog(conn) if replace else None
             result = self._run_import(conn, records)
             result.update(parse_stats)
             result["unique_products"] = len(records)
+            if reset is not None:
+                reset["unmatched_stock_rows"] = self._unnamed_stock_rows(conn)
+                result["reset"] = reset
 
             if dry_run:
                 conn.rollback()
@@ -843,8 +998,14 @@ class ProductCatalog:
                 conn.execute(
                     "INSERT INTO import_batches (filename, imported_at, summary, inventory_revision) "
                     "VALUES (?, ?, ?, ?)",
-                    (filename, _now(), json.dumps(summary), self.get_revision(conn)),
+                    (f"Replace: {filename}" if replace else filename, _now(), json.dumps(summary),
+                     self.get_revision(conn)),
                 )
+                if replace:
+                    stock_history.record(
+                        conn, "CATALOG_RESET", "desktop", details=reset,
+                        note=f"Catalog replaced from {filename}: {reset['catalog_entries']:,} old entries cleared.",
+                    )
                 stock_history.record(conn, "IMPORT", "import", note=f"Catalog import: {filename}", details=summary)
                 conn.commit()
         except Exception:
@@ -856,6 +1017,102 @@ class ProductCatalog:
         if not dry_run:
             self.reload_index()
         return result
+
+    def reset_catalog(self, dry_run=False):
+        """Empties the product catalog (names, item codes, aliases) but keeps all stock.
+
+        Each product that has stock on hand becomes an unnamed product keyed by the barcode
+        its stock was recorded under, exactly as if that code had been scanned before the
+        catalog knew it. So importing a catalog later matches the stock back up by barcode.
+        Products with no stock are removed. Like an import, it can be undone until stock
+        next changes. With dry_run=True it computes the result and rolls back.
+        Returns {'catalog_entries', 'unnamed_kept', 'merged', 'stock_rows'}."""
+        conn = self._connect()
+        try:
+            if not dry_run:
+                self._snapshot(conn)
+            result = self._reset_catalog(conn)
+            if dry_run:
+                conn.rollback()
+            else:
+                self.bump_inventory_revision(conn)
+                conn.execute(
+                    "INSERT INTO import_batches (filename, imported_at, summary, inventory_revision) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("Catalog reset", _now(), json.dumps({"reset": result}), self.get_revision(conn)),
+                )
+                stock_history.record(
+                    conn, "CATALOG_RESET", "desktop", details=result,
+                    note=f"Catalog reset: {result['catalog_entries']:,} entries cleared, stock kept.",
+                )
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        if not dry_run:
+            self.reload_index()
+        return result
+
+    def _reset_catalog(self, conn):
+        """The work of reset_catalog on `conn` (the caller commits or rolls back)."""
+        total = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        stock_keys = [row[0] for row in conn.execute(
+            "SELECT sys_key FROM products WHERE sys_key IN (SELECT sys_key FROM inventory) ORDER BY sys_key"
+        )]
+
+        # The barcode each product's stock was most recently recorded under.
+        codes = {}
+        for sys_key in stock_keys:
+            code = conn.execute(
+                "SELECT barcode FROM inventory WHERE sys_key = ? ORDER BY last_updated DESC, id DESC LIMIT 1",
+                (sys_key,),
+            ).fetchone()[0]
+            if not normalize_identifier(code):
+                alias, item_code = conn.execute(
+                    "SELECT alias, item_code FROM products WHERE sys_key = ?", (sys_key,)
+                ).fetchone()
+                code = alias or item_code or code
+            codes[sys_key] = str(code or "").strip()
+
+        # Products with no stock have nothing to preserve.
+        conn.execute("DELETE FROM products WHERE sys_key NOT IN (SELECT sys_key FROM inventory WHERE sys_key IS NOT NULL)")
+
+        # Park the survivors on unique temporary keys first, so no two of them can collide
+        # on the (item code, alias) uniqueness rule while they are being renamed.
+        for sys_key in stock_keys:
+            conn.execute("UPDATE products SET code_key = ?, alias_key = '' WHERE sys_key = ?",
+                         (f"~reset-{sys_key}", sys_key))
+
+        owners, merged, now = {}, 0, _now()
+        for sys_key in stock_keys:
+            code = codes[sys_key]
+            key = normalize_identifier(code) or f"UNKNOWN-{sys_key}"
+            if key in owners:
+                # Two products whose stock was recorded under the same barcode: one unnamed product.
+                self._merge_inventory(conn, sys_key, owners[key], from_label=code)
+                conn.execute("DELETE FROM products WHERE sys_key = ?", (sys_key,))
+                merged += 1
+                continue
+            owners[key] = sys_key
+            conn.execute(
+                "UPDATE products SET item_code = '', alias = ?, code_key = '', alias_key = ?, description = '', "
+                "is_placeholder = 1, updated_at = ? WHERE sys_key = ?",
+                (code, key, now, sys_key),
+            )
+
+        return {
+            "catalog_entries": total,
+            "unnamed_kept": len(owners),
+            "merged": merged,
+            "stock_rows": conn.execute("SELECT COUNT(*) FROM inventory").fetchone()[0],
+        }
+
+    def _unnamed_stock_rows(self, conn):
+        return conn.execute(
+            "SELECT COUNT(*) FROM inventory i JOIN products p ON p.sys_key = i.sys_key WHERE p.is_placeholder = 1"
+        ).fetchone()[0]
 
     def _snapshot(self, conn):
         """Keeps a copy of products and stock from just before the import,
@@ -992,10 +1249,10 @@ class ProductCatalog:
         removal or resolved scan has changed stock since."""
         batch = self.last_import()
         if not batch:
-            return False, "No import to undo."
+            return False, "No import, replace or reset to undo."
         batch_id, filename, imported_at, revision, undone = batch
         if undone:
-            return False, f"The last import ({filename}) was already undone."
+            return False, f"The last catalog change ({filename}) was already undone."
 
         conn = self._connect()
         try:
@@ -1007,13 +1264,13 @@ class ProductCatalog:
             conn.close()
 
         if not has_snapshot:
-            return False, "The undo data for the last import is no longer available."
+            return False, "The undo data for the last catalog change is no longer available."
         if revision != current_revision:
             return False, (
-                f"Last import: {filename}. It can no longer be undone because stock has "
-                "changed since (scans applied or items removed)."
+                f"Last catalog change: {filename}. It can no longer be undone because stock has "
+                "changed since (scans applied, items added, edited or removed)."
             )
-        return True, f"Last import: {filename} ({imported_at})"
+        return True, f"Last catalog change: {filename} ({imported_at})"
 
     def undo_last_import(self):
         allowed, message = self.can_undo_last_import()
@@ -1029,7 +1286,7 @@ class ProductCatalog:
                 conn.execute(f"DELETE FROM {table}")
                 conn.execute(f"INSERT INTO {table} ({columns}) SELECT {columns} FROM snap_{table}")
             conn.execute("UPDATE import_batches SET undone = 1 WHERE id = ?", (batch_id,))
-            stock_history.record(conn, "IMPORT_UNDO", "desktop", note=f"Undid the catalog import of {filename}.",
+            stock_history.record(conn, "IMPORT_UNDO", "desktop", note=f"Undid the last catalog change ({filename}).",
                                  details={"batch_id": batch_id})
             conn.commit()
         except Exception:

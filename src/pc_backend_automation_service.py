@@ -26,9 +26,11 @@ import stock_history
 import updater
 from product_catalog import (
     ProductCatalog, DatabaseTooNewError, PLACEHOLDER_LABEL, MAPPING_FIELDS, read_table, guess_mapping,
-    validate_mapping, parse_rows, format_import_summary,
+    validate_mapping, parse_rows, format_import_summary, expiry_from_text,
 )
-from ui_theme import ThemeManager, ThemedScrolledText, UI_FONT, make_button, system_prefers_dark
+from ui_theme import (
+    ThemeManager, ThemedScrolledText, ScrollFrame, UI_FONT, fit_window, make_button, system_prefers_dark,
+)
 
 # Dashboard label and row colour for each status code from expiry_report.status_for
 TREE_STATUS = {
@@ -152,7 +154,7 @@ class StockTrackerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Stock Tracker - Manager Dashboard")
-        self.root.geometry("1040x660")
+        self.root.geometry(f"1040x{min(660, max(400, self.root.winfo_screenheight() - 100))}")
         self.root.configure(bg="#f3f4f6") # Light gray background (themed below)
         
         # Project folder when run from source, %LOCALAPPDATA%\\StockTracker when installed
@@ -167,6 +169,7 @@ class StockTrackerApp:
         self.row_menu = None
         self.catalog_refresh = None
         self.history_window = None
+        self.add_item_window = None
         self.expiry_warning_days = DEFAULT_WARNING_DAYS
 
         # init_db() must run first — it creates the settings table that
@@ -700,7 +703,7 @@ class StockTrackerApp:
         """Shows developer-only maintenance tools for the app."""
         dev_window = tk.Toplevel(self.root)
         dev_window.title("Developer Tools")
-        dev_window.geometry("420x240")
+        fit_window(dev_window, 420, 260, self.root)
         dev_window.configure(bg="white")
         dev_window.resizable(False, False)
         dev_window.attributes('-topmost', True)
@@ -740,9 +743,8 @@ class StockTrackerApp:
         """Shows a first-run wizard before the dashboard opens."""
         setup_window = tk.Toplevel(self.root)
         setup_window.title("Stock Tracker Setup")
-        # Cap the height to the screen so the window never runs off the bottom.
-        window_height = min(900, setup_window.winfo_screenheight() - 100)
-        setup_window.geometry(f"640x{window_height}")
+        # Capped to the screen so the window (and its pinned footer buttons) never runs off the edge.
+        fit_window(setup_window, 640, 900, self.root)
         setup_window.configure(bg="white")
         setup_window.resizable(False, True)
         setup_window.attributes('-topmost', True)
@@ -966,7 +968,7 @@ class StockTrackerApp:
 
     def setup_ui(self):
         """Builds the dashboard: header, toolbar, inventory table and legend."""
-        self.root.minsize(920, 560)
+        self.root.minsize(920, min(560, max(400, self.root.winfo_screenheight() - 100)))
 
         # Header
         header = tk.Frame(self.root, bg="#ffffff", padx=28, pady=18)
@@ -985,7 +987,7 @@ class StockTrackerApp:
 
         tk.Frame(self.root, bg="#e5e7eb", height=1).pack(fill=tk.X, side=tk.TOP)
 
-        # Toolbar: catalog actions on the left, inventory actions on the right
+        # Toolbar: catalog, report and history windows on the left, app windows on the right
         toolbar = tk.Frame(self.root, bg="#f3f4f6", padx=28)
         toolbar.pack(fill=tk.X, side=tk.TOP, pady=(18, 0))
 
@@ -998,8 +1000,19 @@ class StockTrackerApp:
         make_button(toolbar, "🛠  Dev Tools", self.open_developer_tools, "neutral").pack(side=tk.RIGHT, padx=(10, 0))
         make_button(toolbar, "⚙  Settings", self.open_settings_window, "neutral").pack(side=tk.RIGHT, padx=(10, 0))
         make_button(toolbar, "📱  Connect Mobile", self.show_mobile_setup, "neutral").pack(side=tk.RIGHT, padx=(10, 0))
-        make_button(toolbar, "🗑  Remove Selected", self.delete_selected, "danger").pack(side=tk.RIGHT, padx=(10, 0))
-        make_button(toolbar, "↻  Refresh", self.refresh_data, "success").pack(side=tk.RIGHT)
+
+        # Actions on the stock table sit in their own row just above it, so the top toolbar can't overflow
+        stock_actions = tk.Frame(self.root, bg="#f3f4f6", padx=28)
+        stock_actions.pack(fill=tk.X, side=tk.TOP, pady=(12, 0))
+        make_button(stock_actions, "＋  Add Item", self.open_add_item_dialog, "primary").pack(side=tk.LEFT)
+        make_button(stock_actions, "🗑  Remove Selected", self.delete_selected, "danger").pack(side=tk.LEFT, padx=(10, 0))
+        make_button(stock_actions, "↻  Refresh", self.refresh_data, "success").pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(stock_actions, text="Right-click a row to edit it.", font=(UI_FONT, 9), bg="#f3f4f6", fg="#6b7280").pack(side=tk.RIGHT)
+        self.root.bind("<Control-n>", lambda _e: self.open_add_item_dialog())
+
+        # The window may never be narrower than the toolbar needs (button widths depend on the PC's text size)
+        self.root.update_idletasks()
+        self.root.minsize(max(920, toolbar.winfo_reqwidth() + 8), min(560, max(400, self.root.winfo_screenheight() - 100)))
 
         # Legend goes in before the table so the table can't squeeze it out
         legend_frame = tk.Frame(self.root, bg="#f3f4f6", padx=28, pady=12)
@@ -1012,7 +1025,7 @@ class StockTrackerApp:
 
         # Inventory table, in a bordered card
         card = tk.Frame(self.root, bg="#ffffff", relief=tk.SOLID, bd=1)
-        card.pack(fill=tk.BOTH, expand=True, padx=28, pady=(18, 0))
+        card.pack(fill=tk.BOTH, expand=True, padx=28, pady=(12, 0))
 
         tree_scroll = ttk.Scrollbar(card)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1129,7 +1142,7 @@ class StockTrackerApp:
         win = tk.Toplevel(self.root)
         self.catalog_window = win
         win.title("Product Catalog")
-        win.geometry("860x640")
+        fit_window(win, 860, 640, self.root, min_width=640)
         win.configure(bg="white")
 
         header = tk.Frame(win, bg="white", padx=20, pady=16)
@@ -1139,7 +1152,8 @@ class StockTrackerApp:
             header,
             text=(
                 "Maps each alias/barcode and item code to one product, so scanning either finds the same stock. "
-                "Importing a file adds and updates products; it never deletes existing ones."
+                "Importing a file adds and updates products; it never deletes existing ones. "
+                "To start over, use Replace or Reset in Settings."
             ),
             font=(UI_FONT, 9), bg="white", fg="#4b5563", wraplength=800, justify=tk.LEFT,
         ).pack(anchor="w", pady=(4, 0))
@@ -1154,6 +1168,10 @@ class StockTrackerApp:
         search_entry = tk.Entry(actions, textvariable=search_var, width=30, relief=tk.SOLID, bd=1, font=(UI_FONT, 10))
         search_entry.pack(side=tk.RIGHT, ipady=4)
         tk.Label(actions, text="Search", font=(UI_FONT, 9, "bold"), bg="white", fg="#6b7280").pack(side=tk.RIGHT, padx=(0, 8))
+
+        # The note under the table is packed first (to the bottom) so the table can't squeeze it out
+        undo_note = tk.Label(win, textvariable=undo_info_var, font=(UI_FONT, 9), bg="white", fg="#6b7280", anchor="w", padx=20, wraplength=800, justify=tk.LEFT)
+        undo_note.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
 
         table_frame = tk.Frame(win, bg="white", padx=20, pady=10)
         table_frame.pack(fill=tk.BOTH, expand=True)
@@ -1190,33 +1208,34 @@ class StockTrackerApp:
 
         def undo_import():
             if not messagebox.askyesno(
-                "Undo import",
-                "Restore the products and stock to how they were before the last import?",
+                "Undo last change",
+                "Restore the products and stock to how they were before the last catalog change "
+                "(an import, a replace or a reset)?",
                 parent=win,
             ):
                 return
             try:
                 self.catalog.undo_last_import()
             except ValueError as e:
-                messagebox.showwarning("Undo import", str(e), parent=win)
+                messagebox.showwarning("Undo last change", str(e), parent=win)
                 return
             refresh()
             self.refresh_data(run_sync=False)
-            messagebox.showinfo("Undo import", "The last import was undone.", parent=win)
+            messagebox.showinfo("Undo last change", "The last catalog change was undone.", parent=win)
 
         tk.Button(actions, text="Import CSV...", command=choose_file, bg="#3b82f6", fg="white", relief=tk.FLAT, padx=14, pady=6, cursor="hand2").pack(side=tk.LEFT)
-        undo_button = tk.Button(actions, text="Undo last import", command=undo_import, bg="#f3f4f6", fg="#111827", relief=tk.FLAT, padx=14, pady=6, cursor="hand2")
+        undo_button = tk.Button(actions, text="Undo last change", command=undo_import, bg="#f3f4f6", fg="#111827", relief=tk.FLAT, padx=14, pady=6, cursor="hand2")
         undo_button.pack(side=tk.LEFT, padx=(10, 0))
-        tk.Label(win, textvariable=undo_info_var, font=(UI_FONT, 9), bg="white", fg="#6b7280", anchor="w", padx=20, wraplength=800, justify=tk.LEFT).pack(fill=tk.X, pady=(6, 0))
 
         search_var.trace_add("write", refresh)
         refresh()
         self.catalog_refresh = refresh
         self.theme.style(win)
 
-    def open_import_dialog(self, path, on_done):
+    def open_import_dialog(self, path, on_done, replace=False):
         """Column-mapping wizard: pick which column is which field, preview what the
-        import would change, then apply it."""
+        import would change, then apply it. With replace=True the file becomes the whole
+        catalog (the old products are cleared, stock is kept and matched by barcode)."""
         try:
             headers, rows, delimiter, encoding = read_table(path)
         except Exception as e:
@@ -1227,18 +1246,27 @@ class StockTrackerApp:
             return
 
         dlg = tk.Toplevel(self.root)
-        dlg.title("Import Products")
-        dlg.geometry("900x800")
+        dlg.title("Replace Product Catalog" if replace else "Import Products")
+        fit_window(dlg, 900, 840 if replace else 800, self.root, min_width=560)
         dlg.configure(bg="white")
         dlg.transient(self.root)
         dlg.grab_set()
 
-        body = tk.Frame(dlg, bg="white", padx=20, pady=16)
-        body.pack(fill=tk.BOTH, expand=True)
+        # The buttons live in a footer pinned to the bottom edge; only the content above scrolls.
+        button_row = tk.Frame(dlg, bg="white", padx=20, pady=12, bd=1, relief=tk.GROOVE)
+        button_row.pack(side=tk.BOTTOM, fill=tk.X)
+        scroller = ScrollFrame(dlg, padx=20, pady=16)
+        scroller.pack(fill=tk.BOTH, expand=True)
+        body = scroller.body
 
         delimiter_names = {",": "comma", "\t": "tab", ";": "semicolon", "|": "pipe"}
-        tk.Label(body, text=f"Import: {os.path.basename(path)}", font=(UI_FONT, 13, "bold"), bg="white", fg="#111827").pack(anchor="w")
+        tk.Label(body, text=f"{'Replace catalog with' if replace else 'Import'}: {os.path.basename(path)}", font=(UI_FONT, 13, "bold"), bg="white", fg="#111827").pack(anchor="w")
         tk.Label(body, text=f"{len(rows):,} data rows, {delimiter_names[delimiter]}-separated, {encoding}", font=(UI_FONT, 9), bg="white", fg="#6b7280").pack(anchor="w", pady=(2, 10))
+        if replace:
+            tk.Label(body, text="This REPLACES the whole catalog: every existing product is removed and this file becomes the catalog. "
+                                "Stock on hand is kept and matched back up to the new products by barcode. Nothing changes until you "
+                                "preview and confirm.",
+                     font=(UI_FONT, 9, "bold"), bg="white", fg="#b91c1c", wraplength=760, justify=tk.LEFT).pack(anchor="w", pady=(0, 10))
         tk.Label(body, text="Choose which column holds each field. Column names and order can differ from file to file.", font=(UI_FONT, 9), bg="white", fg="#4b5563").pack(anchor="w", pady=(0, 6))
 
         choices = ["(none)"] + [f"{i + 1}: {h or '(blank)'}" for i, h in enumerate(headers)]
@@ -1273,11 +1301,12 @@ class StockTrackerApp:
         file_tree.pack(fill=tk.X)
         file_scroll.pack(fill=tk.X)
 
-        tk.Label(body, text="What this import would change", font=(UI_FONT, 9, "bold"), bg="white").pack(anchor="w", pady=(12, 4))
-        summary_box = ThemedScrolledText(body, height=14, wrap=tk.WORD, font=("Consolas", 9), bg="#f9fafb", relief=tk.SOLID, bd=1, state="disabled")
+        tk.Label(body, text="What this replacement would change" if replace else "What this import would change",
+                 font=(UI_FONT, 9, "bold"), bg="white").pack(anchor="w", pady=(12, 4))
+        summary_box = ThemedScrolledText(body, height=12, wrap=tk.WORD, font=("Consolas", 9), bg="#f9fafb", relief=tk.SOLID, bd=1, state="disabled")
         summary_box.pack(fill=tk.BOTH, expand=True)
 
-        state = {"records": None, "stats": None}
+        state = {"records": None, "stats": None, "result": None}
 
         def set_summary(text):
             summary_box.configure(state="normal")
@@ -1294,9 +1323,10 @@ class StockTrackerApp:
 
         def invalidate(_event=None):
             # Any change to the column choice makes the last preview stale.
-            state["records"] = state["stats"] = None
+            state["records"] = state["stats"] = state["result"] = None
             import_button.config(state=tk.DISABLED)
-            set_summary("Click \"Preview changes\" to see what this import would do. Nothing is changed until you click Import.")
+            set_summary(f"Click \"Preview changes\" to see what this {'replacement' if replace else 'import'} would do. "
+                        f"Nothing is changed until you click {'Replace catalog' if replace else 'Import'}.")
 
         def run_preview():
             mapping = current_mapping()
@@ -1309,15 +1339,22 @@ class StockTrackerApp:
             dlg.update_idletasks()
             try:
                 records, parse_stats = parse_rows(rows, mapping)
-                result = self.catalog.import_records(records, parse_stats, os.path.basename(path), dry_run=True)
+                result = self.catalog.import_records(records, parse_stats, os.path.basename(path), dry_run=True, replace=replace)
             except Exception as e:
-                messagebox.showerror("Import", f"Could not preview this file: {e}", parent=dlg)
+                messagebox.showerror("Replace catalog" if replace else "Import", f"Could not preview this file: {e}", parent=dlg)
                 return
             finally:
                 preview_button.config(state=tk.NORMAL, text="Preview changes")
 
-            state["records"], state["stats"] = records, parse_stats
+            state["records"], state["stats"], state["result"] = records, parse_stats, result
             text = format_import_summary(result)
+            if replace:
+                reset = result["reset"]
+                text = (
+                    f"Existing catalog cleared: {reset['catalog_entries']:,} products\n"
+                    f"Stock kept: {reset['stock_rows']:,} rows. {reset['stock_rows'] - reset['unmatched_stock_rows']:,} match a product in this file; "
+                    f"{reset['unmatched_stock_rows']:,} don't and stay as \"{PLACEHOLDER_LABEL}\" under their barcode.\n\n"
+                ) + text
             if result["samples"]["new"]:
                 text += "\n\nNew products (first few):\n" + "\n".join(
                     f"  {desc or PLACEHOLDER_LABEL}   [code {code or '-'}, alias {alias or '-'}]"
@@ -1328,38 +1365,54 @@ class StockTrackerApp:
                     f"  {old or PLACEHOLDER_LABEL}  ->  {new}" for old, new in result["samples"]["updated"]
                 )
 
-            changes = result["new"] or result["updated"] or result["upgraded"] or result["absorbed"]
-            text += "\n\n" + ("Nothing has been changed yet. Click Import to apply." if changes else "This file would not change anything.")
+            changes = replace or result["new"] or result["updated"] or result["upgraded"] or result["absorbed"]
+            action = "Replace catalog" if replace else "Import"
+            text += "\n\n" + (f"Nothing has been changed yet. Click {action} to apply." if changes else "This file would not change anything.")
             set_summary(text)
             import_button.config(state=tk.NORMAL if changes else tk.DISABLED)
 
         def run_import():
             mapping = current_mapping()
-            import_button.config(state=tk.DISABLED, text="Importing...")
+            if replace:
+                reset = state["result"]["reset"]
+                if not messagebox.askyesno(
+                    "Replace product catalog",
+                    f"This removes all {reset['catalog_entries']:,} existing products and replaces them with the "
+                    f"{state['result']['unique_products']:,} in this file.\n\n"
+                    f"Stock is kept ({reset['stock_rows']:,} rows); {reset['unmatched_stock_rows']:,} of those don't match the "
+                    "new file and stay unnamed. A backup copy of the database is saved first, and you can undo this from the "
+                    "Product Catalog window until stock next changes.\n\nReplace the catalog?",
+                    icon="warning", parent=dlg,
+                ):
+                    return
+                if self.backup_before_catalog_change(dlg, "Replace product catalog") is None:
+                    return
+            import_button.config(state=tk.DISABLED, text="Replacing..." if replace else "Importing...")
             dlg.update_idletasks()
             try:
                 self.catalog.save_mapping(headers, mapping)
-                result = self.catalog.import_records(state["records"], state["stats"], os.path.basename(path))
+                result = self.catalog.import_records(state["records"], state["stats"], os.path.basename(path), replace=replace)
             except Exception as e:
-                messagebox.showerror("Import", f"The import failed and nothing was changed: {e}", parent=dlg)
-                import_button.config(state=tk.NORMAL, text="Import")
+                messagebox.showerror("Replace catalog" if replace else "Import",
+                                     f"The {'replacement' if replace else 'import'} failed and nothing was changed: {e}", parent=dlg)
+                import_button.config(state=tk.NORMAL, text="Replace catalog" if replace else "Import")
                 return
 
             dlg.destroy()
             on_done()
             self.refresh_data(run_sync=False)
             messagebox.showinfo(
-                "Import complete",
-                format_import_summary(result)
+                "Catalog replaced" if replace else "Import complete",
+                (f"The catalog now has the products from {os.path.basename(path)}. "
+                 f"{result['reset']['unmatched_stock_rows']:,} stock rows aren't in it and stay unnamed.\n\n" if replace else "")
+                + format_import_summary(result)
                 + "\n\nYou can undo this from the Product Catalog window, until stock next changes.",
             )
 
         for combo in combos.values():
             combo.bind("<<ComboboxSelected>>", invalidate)
 
-        button_row = tk.Frame(body, bg="white")
-        button_row.pack(fill=tk.X, pady=(12, 0))
-        import_button = tk.Button(button_row, text="Import", command=run_import, bg="#3b82f6", fg="white", relief=tk.FLAT, padx=16, pady=8, state=tk.DISABLED)
+        import_button = tk.Button(button_row, text="Replace catalog" if replace else "Import", command=run_import, bg="#3b82f6", fg="white", relief=tk.FLAT, padx=16, pady=8, state=tk.DISABLED)
         import_button.pack(side=tk.RIGHT)
         tk.Button(button_row, text="Cancel", command=dlg.destroy, bg="#f3f4f6", fg="#111827", relief=tk.FLAT, padx=16, pady=8).pack(side=tk.RIGHT, padx=(0, 10))
         preview_button = tk.Button(button_row, text="Preview changes", command=run_preview, bg="#10b981", fg="white", relief=tk.FLAT, padx=16, pady=8)
@@ -1372,8 +1425,12 @@ class StockTrackerApp:
         """Scans whose alias/item code matches several products wait here until the user picks one."""
         win = tk.Toplevel(self.root)
         win.title("Pending Scans")
-        win.geometry("820x640")
+        fit_window(win, 820, 640, self.root, min_width=600)
         win.configure(bg="white")
+
+        # Buttons are pinned to the bottom edge first, so a short window can't push them off screen
+        button_row = tk.Frame(win, bg="white", padx=20, pady=14, bd=1, relief=tk.GROOVE)
+        button_row.pack(side=tk.BOTTOM, fill=tk.X)
 
         header = tk.Frame(win, bg="white", padx=20, pady=16)
         header.pack(fill=tk.X)
@@ -1395,7 +1452,7 @@ class StockTrackerApp:
         for column, width in (("Product", 420), ("Item Code", 130), ("Alias", 190)):
             candidate_tree.heading(column, text=column, anchor=tk.W)
             candidate_tree.column(column, width=width, anchor=tk.W)
-        candidate_tree.pack(fill=tk.X, padx=20)
+        candidate_tree.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 10))
 
         # Tk turns numeric-looking strings in tree values back into numbers,
         # which would drop leading zeros from barcodes, so keep the originals here.
@@ -1444,8 +1501,6 @@ class StockTrackerApp:
             refresh()
             self.refresh_data(run_sync=False)
 
-        button_row = tk.Frame(win, bg="white", padx=20, pady=14)
-        button_row.pack(fill=tk.X)
         tk.Button(button_row, text="Assign to selected product", command=lambda: resolve(True), bg="#3b82f6", fg="white", relief=tk.FLAT, padx=14, pady=8).pack(side=tk.LEFT)
         tk.Button(button_row, text="Record as unnamed product", command=lambda: resolve(False), bg="#f3f4f6", fg="#111827", relief=tk.FLAT, padx=14, pady=8).pack(side=tk.LEFT, padx=(10, 0))
 
@@ -1463,15 +1518,16 @@ class StockTrackerApp:
 
         win = tk.Toplevel(self.root)
         win.title("Export Expiry List")
-        win.geometry(f"660x{min(700, win.winfo_screenheight() - 110)}")
+        fit_window(win, 660, 700, self.root)
         win.configure(bg="white")
         win.transient(self.root)
         win.grab_set()
 
         footer = tk.Frame(win, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
         footer.pack(side=tk.BOTTOM, fill=tk.X)
-        body = tk.Frame(win, bg="white", padx=24, pady=18)
-        body.pack(fill=tk.BOTH, expand=True)
+        scroller = ScrollFrame(win, padx=24, pady=18)
+        scroller.pack(fill=tk.BOTH, expand=True)
+        body = scroller.body
 
         tk.Label(body, text="Export expiry list", font=(UI_FONT, 14, "bold"), bg="white", fg="#111827").pack(anchor="w")
         tk.Label(body, text="Choose what to include and how to arrange it, then save it as a PDF or CSV file.", font=(UI_FONT, 9), bg="white", fg="#6b7280").pack(anchor="w", pady=(2, 12))
@@ -1667,7 +1723,7 @@ class StockTrackerApp:
         win = tk.Toplevel(self.root)
         self.history_window = win
         win.title("Stock History")
-        win.geometry(f"1120x{min(740, win.winfo_screenheight() - 100)}")
+        fit_window(win, 1120, 740, self.root, min_width=700, min_height=420)
         win.configure(bg="white")
 
         footer = tk.Frame(win, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
@@ -1715,7 +1771,7 @@ class StockTrackerApp:
         for index, (code, label) in enumerate(stock_history.EVENT_LABELS.items()):
             event_vars[code] = tk.BooleanVar(value=True)
             tk.Checkbutton(event_grid, text=label, variable=event_vars[code], command=lambda: refresh(), bg="#f9fafb", fg="#111827",
-                           font=(UI_FONT, 9), anchor="w", bd=0, highlightthickness=0).grid(row=index // 4, column=index % 4, sticky="w", padx=(0, 18))
+                           font=(UI_FONT, 9), anchor="w", bd=0, highlightthickness=0).grid(row=index // 5, column=index % 5, sticky="w", padx=(0, 18))
 
         # -- search --
         search_row = tk.Frame(filters, bg="#f9fafb")
@@ -1905,7 +1961,7 @@ class StockTrackerApp:
         """Shows what's new in a release and offers a one-click install."""
         dlg = tk.Toplevel(self.root)
         dlg.title("Update Available")
-        dlg.geometry("640x600")
+        fit_window(dlg, 640, 600, parent)
         dlg.configure(bg="white")
         dlg.transient(parent)
 
@@ -2044,6 +2100,223 @@ class StockTrackerApp:
 
         self.theme.style(dlg)
 
+    def after_catalog_change(self):
+        """Refreshes everything that shows products or stock after the catalog was changed."""
+        self.refresh_data(run_sync=False)
+        if self.catalog_window is not None and self.catalog_window.winfo_exists():
+            self.catalog_refresh()
+
+    def open_add_item_dialog(self):
+        """Adds stock by hand, for example an item found on a shelf that is close to expiring.
+        It goes through the same product matching as a phone scan, and is logged in History
+        as a manual add."""
+        if not self.setup_completed:
+            return
+        if self.add_item_window is not None and self.add_item_window.winfo_exists():
+            self.add_item_window.lift()
+            return
+
+        dlg = tk.Toplevel(self.root)
+        self.add_item_window = dlg
+        dlg.title("Add Item")
+        fit_window(dlg, 580, 700, self.root)
+        dlg.configure(bg="white")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        footer = tk.Frame(dlg, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        scroller = ScrollFrame(dlg, padx=24, pady=20)
+        scroller.pack(fill=tk.BOTH, expand=True)
+        body = scroller.body
+
+        tk.Label(body, text="Add item", font=(UI_FONT, 14, "bold"), bg="white", fg="#111827").pack(anchor="w")
+        tk.Label(
+            body,
+            text="Record stock by hand, such as an item you found that is close to expiring. It is added just like "
+                 "a scan (an existing row for the same product and expiry goes up) and shows in History as a manual add.",
+            font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=520, justify=tk.LEFT,
+        ).pack(anchor="w", pady=(2, 14))
+
+        def section(title):
+            frame = tk.Frame(body, bg="#f9fafb", relief=tk.SOLID, bd=1, padx=16, pady=14)
+            frame.pack(fill=tk.X, pady=(0, 14))
+            tk.Label(frame, text=title, font=(UI_FONT, 10, "bold"), bg="#f9fafb", fg="#111827").pack(anchor="w", pady=(0, 6))
+            return frame
+
+        def field(parent, label, variable, width=None):
+            row = tk.Frame(parent, bg="#f9fafb")
+            row.pack(fill=tk.X, pady=3)
+            tk.Label(row, text=label, width=15, anchor="w", font=(UI_FONT, 9, "bold"), bg="#f9fafb", fg="#374151").pack(side=tk.LEFT)
+            entry = tk.Entry(row, textvariable=variable, relief=tk.SOLID, bd=1, font=(UI_FONT, 10), **({"width": width} if width else {}))
+            entry.pack(side=tk.LEFT, ipady=4, **({} if width else {"fill": tk.X, "expand": True}))
+            return entry
+
+        def note(parent, variable, color="#4b5563"):
+            label = tk.Label(parent, textvariable=variable, font=(UI_FONT, 9), bg="#f9fafb", fg=color,
+                             wraplength=490, justify=tk.LEFT, anchor="w")
+            label.pack(fill=tk.X, pady=(2, 0))
+            return label
+
+        code_var, name_var = tk.StringVar(), tk.StringVar()
+        expiry_var, qty_var = tk.StringVar(), tk.StringVar(value="1")
+        match_var, expiry_note_var, total_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        status_var = tk.StringVar()
+        keep_open = tk.BooleanVar(value=False)
+
+        item_box = section("Item")
+        code_entry = field(item_box, "Barcode / code", code_var)
+        note(item_box, match_var)
+        choice_row = tk.Frame(item_box, bg="#f9fafb")
+        choice_box = ttk.Combobox(choice_row, state="readonly", width=58)
+        choice_box.pack(side=tk.LEFT, pady=(6, 0))
+        name_entry = field(item_box, "Product name", name_var)
+
+        stock_box = section("Stock")
+        expiry_entry = field(stock_box, "Expiry (month)", expiry_var, width=14)
+        note(stock_box, expiry_note_var)
+        field(stock_box, "Quantity", qty_var, width=14)
+        note(stock_box, total_var, "#1d4ed8")
+
+        note(body, status_var, "#047857").configure(bg="white", font=(UI_FONT, 9, "bold"))
+
+        state = {"choices": [], "locked": False, "typed_name": ""}
+
+        def chosen_key():
+            if len(state["choices"]) > 1 and choice_box.current() >= 0:
+                return state["choices"][choice_box.current()]["sys_key"]
+            if len(state["choices"]) == 1:
+                return state["choices"][0]["sys_key"]
+            return None
+
+        def set_name_lock(locked, text=""):
+            # While the catalog supplies the name, what the person typed is set aside and put back if they
+            # change the code to something the catalog doesn't know.
+            if locked and not state["locked"]:
+                state["typed_name"] = name_var.get()
+            if locked:
+                name_var.set(text)
+                name_entry.configure(state="disabled")
+            elif state["locked"]:
+                name_var.set(state["typed_name"])
+                name_entry.configure(state="normal")
+            state["locked"] = locked
+
+        def describe(product):
+            ids = ", ".join(part for part in (
+                f"code {product['item_code']}" if product["item_code"] else "",
+                f"alias {product['alias']}" if product["alias"] else "") if part)
+            return f"{product['description'] or PLACEHOLDER_LABEL}  [{ids or 'no codes'}]"
+
+        def refresh_match(*_args):
+            code = code_var.get().strip()
+            candidates = self.catalog.candidates_for(code) if code else []
+            same = [p["sys_key"] for p in candidates] == [p["sys_key"] for p in state["choices"]]
+            if not same:
+                candidates.sort(key=lambda p: (p["description"] or "￿").lower())
+                state["choices"] = candidates
+                choice_box.configure(values=[describe(p) for p in candidates])
+                choice_box.set("")
+            candidates = state["choices"]
+
+            if len(candidates) > 1:
+                choice_row.pack(fill=tk.X, before=name_entry.master)
+                match_var.set(f"This code matches {len(candidates)} products. Choose which one it is:")
+                product = candidates[choice_box.current()] if choice_box.current() >= 0 else None
+                set_name_lock(True, (product["description"] or "") if product else "")
+            else:
+                choice_row.pack_forget()
+                if not code:
+                    match_var.set("Type or paste the barcode or item code.")
+                    set_name_lock(False)
+                elif not candidates:
+                    match_var.set("Not in the catalog. It will be added as a new product: enter its name below, or leave "
+                                  "the name blank to add it as an unnamed product.")
+                    set_name_lock(False)
+                elif candidates[0]["is_placeholder"]:
+                    match_var.set("Known only as an unnamed product. Enter a name below to fill it in.")
+                    set_name_lock(False)
+                else:
+                    match_var.set("✔ In the catalog. The product's name is used.")
+                    set_name_lock(True, candidates[0]["description"])
+            refresh_stock()
+
+        def refresh_stock(*_args):
+            expiry_text = expiry_var.get().strip()
+            expiry = None
+            if not expiry_text:
+                expiry_note_var.set("Written as 2027-03 or 03/2027.")
+            else:
+                try:
+                    expiry = expiry_from_text(expiry_text)
+                    status = TREE_STATUS[expiry_report.status_for(expiry, self.expiry_warning_days)][0]
+                    expiry_note_var.set(f"{expiry}: shows as {status}.")
+                except ValueError as e:
+                    expiry_note_var.set(str(e))
+
+            try:
+                quantity = int(qty_var.get().strip())
+            except ValueError:
+                quantity = None
+            key = chosen_key()
+            if expiry and quantity and quantity > 0 and key is not None:
+                before = self.catalog.stock_quantity(key, expiry)
+                total_var.set(f"Stock for this expiry: {before:,} now, {before + quantity:,} after adding." if before
+                              else f"Starts a new stock row of {quantity:,}.")
+            elif expiry and quantity and quantity > 0 and code_var.get().strip() and not state["choices"]:
+                total_var.set(f"Starts a new stock row of {quantity:,}.")
+            else:
+                total_var.set("")
+
+        def add(_event=None):
+            try:
+                result = self.catalog.add_stock_item(
+                    code_var.get(), qty_var.get(), expiry_var.get(),
+                    description="" if state["locked"] else name_var.get(), sys_key=chosen_key(),
+                )
+            except ValueError as e:
+                messagebox.showwarning("Can't add this item", str(e), parent=dlg)
+                return
+
+            self.refresh_data(run_sync=False)
+            row_id = self.catalog.stock_row_id(result["sys_key"], result["expiry"])
+            for item in self.tree.get_children():
+                if int(self.tree.item(item, "values")[0]) == row_id:
+                    self.tree.selection_set(item)
+                    self.tree.see(item)
+                    break
+            if (result["created_product"] or result["named_product"]) \
+                    and self.catalog_window is not None and self.catalog_window.winfo_exists():
+                self.catalog_refresh()
+
+            summary = (f"Added {result['added']:,} × {result['product']}, expiring {result['expiry']}"
+                       + (f" (now {result['after']:,} for that expiry)." if result["before"] else "."))
+            if not keep_open.get():
+                dlg.destroy()
+                return
+            status_var.set("✔ " + summary)
+            for variable in (code_var, name_var):
+                variable.set("")
+            qty_var.set("1")
+            set_name_lock(False)
+            code_entry.focus_set()
+
+        make_button(footer, "Add to stock", add, "primary").pack(side=tk.RIGHT)
+        make_button(footer, "Close", dlg.destroy, "neutral").pack(side=tk.RIGHT, padx=(0, 10))
+        tk.Checkbutton(footer, text="Keep this window open to add another", variable=keep_open, bg="white",
+                       fg="#111827", font=(UI_FONT, 9), bd=0, highlightthickness=0).pack(side=tk.LEFT)
+
+        code_var.trace_add("write", refresh_match)
+        choice_box.bind("<<ComboboxSelected>>", refresh_match)
+        expiry_var.trace_add("write", refresh_stock)
+        qty_var.trace_add("write", refresh_stock)
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.bind("<Return>", add)
+
+        refresh_match()
+        self.theme.style(dlg)
+        code_entry.focus_set()
+
     def show_row_menu(self, event):
         """Right-click menu for the stock table."""
         row_id = self.tree.identify_row(event.y)
@@ -2079,15 +2352,16 @@ class StockTrackerApp:
 
         dlg = tk.Toplevel(self.root)
         dlg.title("Edit Information")
-        dlg.geometry("560x640")
+        fit_window(dlg, 560, 640, self.root)
         dlg.configure(bg="white")
         dlg.transient(self.root)
         dlg.grab_set()
 
         footer = tk.Frame(dlg, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
         footer.pack(side=tk.BOTTOM, fill=tk.X)
-        body = tk.Frame(dlg, bg="white", padx=24, pady=20)
-        body.pack(fill=tk.BOTH, expand=True)
+        scroller = ScrollFrame(dlg, padx=24, pady=20)
+        scroller.pack(fill=tk.BOTH, expand=True)
+        body = scroller.body
 
         tk.Label(body, text="Edit information", font=(UI_FONT, 14, "bold"), bg="white", fg="#111827").pack(anchor="w")
         tk.Label(body, text=info["description"] or PLACEHOLDER_LABEL, font=(UI_FONT, 9), bg="white", fg="#6b7280").pack(anchor="w", pady=(2, 14))
@@ -2188,18 +2462,83 @@ class StockTrackerApp:
         self.theme.style(dlg)
         first_entry.focus_set()
 
+    def backup_before_catalog_change(self, parent, what):
+        """Saves a copy of the database first. Returns its path, or None (after telling the user,
+        and with nothing changed) if the copy couldn't be made."""
+        try:
+            return updater.backup_database(self.db_path, reason="before-catalog-change")
+        except Exception as e:
+            messagebox.showerror(
+                what, f"A safety backup of the database couldn't be saved, so nothing was changed.\n\n{e}", parent=parent)
+            return None
+
+    def reset_catalog_flow(self, parent):
+        """Settings > Reset catalog: clears every product but keeps the stock on hand."""
+        try:
+            preview = self.catalog.reset_catalog(dry_run=True)
+        except Exception as e:
+            messagebox.showerror("Reset catalog", f"Could not prepare the reset: {e}", parent=parent)
+            return
+        if not preview["catalog_entries"]:
+            messagebox.showinfo("Reset catalog", "The catalog is already empty.", parent=parent)
+            return
+
+        if not messagebox.askyesno(
+            "Reset product catalog",
+            f"This clears the product catalog: {preview['catalog_entries']:,} products with their names, item codes and aliases.\n\n"
+            f"Stock is NOT deleted. The {preview['stock_rows']:,} stock rows ({preview['unnamed_kept']:,} products) stay, "
+            f"shown as \"{PLACEHOLDER_LABEL}\" under their barcode until you import a catalog again, which matches them back up.\n\n"
+            "The stock history is kept. A backup copy of the database is saved first, and you can undo the reset from the "
+            "Product Catalog window until stock next changes.\n\nContinue?",
+            icon="warning", parent=parent,
+        ):
+            return
+        typed = simpledialog.askstring("Reset product catalog", "Type RESET (in capitals) to confirm.", parent=parent)
+        if typed is None or typed.strip() != "RESET":
+            if typed is not None:
+                messagebox.showinfo("Reset product catalog", "That wasn't RESET, so nothing was changed.", parent=parent)
+            return
+
+        backup = self.backup_before_catalog_change(parent, "Reset product catalog")
+        if backup is None:
+            return
+        try:
+            self.catalog.reset_catalog()
+        except Exception as e:
+            messagebox.showerror("Reset product catalog", f"The reset failed and nothing was changed: {e}", parent=parent)
+            return
+        self.after_catalog_change()
+        messagebox.showinfo(
+            "Catalog reset",
+            f"The catalog was cleared. {preview['stock_rows']:,} stock rows were kept.\n\n"
+            "Import a product list (Products > Import CSV) to name them again, or use Undo in the Product Catalog window.\n\n"
+            f"Backup saved in: {os.path.dirname(backup)}",
+            parent=parent,
+        )
+
+    def replace_catalog_flow(self, parent):
+        """Settings > Replace from file: the chosen file becomes the whole catalog."""
+        path = filedialog.askopenfilename(
+            parent=parent,
+            title="Choose the new product list",
+            filetypes=[("CSV / text files", "*.csv *.tsv *.txt"), ("All files", "*.*")],
+        )
+        if path:
+            self.open_import_dialog(path, self.after_catalog_change, replace=True)
+
     def open_settings_window(self):
         """Preferences that can be changed after first-run setup."""
         win = tk.Toplevel(self.root)
         win.title("Settings")
-        win.geometry("480x600")
+        fit_window(win, 480, 780, self.root)
         win.configure(bg="white")
         win.transient(self.root)
 
         footer = tk.Frame(win, bg="white", padx=24, pady=14, bd=1, relief=tk.GROOVE)
         footer.pack(side=tk.BOTTOM, fill=tk.X)
-        body = tk.Frame(win, bg="white", padx=24, pady=20)
-        body.pack(fill=tk.BOTH, expand=True)
+        scroller = ScrollFrame(win, padx=24, pady=20)
+        scroller.pack(fill=tk.BOTH, expand=True)
+        body = scroller.body
 
         tk.Label(body, text="Settings", font=(UI_FONT, 14, "bold"), bg="white", fg="#111827").pack(anchor="w")
         tk.Label(body, text="Expiring-soon warning", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(16, 0))
@@ -2207,6 +2546,15 @@ class StockTrackerApp:
         combo = ttk.Combobox(body, state="readonly", width=14, values=self.warning_day_choices())
         combo.set(f"{self.expiry_warning_days} days")
         combo.pack(anchor="w")
+
+        tk.Label(body, text="Product catalog", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(20, 0))
+        tk.Label(body, text="Start over with a new product list. Stock on hand is always kept and matched back up by "
+                            "barcode. A backup is saved first, and it can be undone until stock next changes.",
+                 font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=420, justify=tk.LEFT).pack(anchor="w", pady=(2, 8))
+        catalog_buttons = tk.Frame(body, bg="white")
+        catalog_buttons.pack(anchor="w")
+        make_button(catalog_buttons, "Replace from file...", lambda: self.replace_catalog_flow(win), "neutral").pack(side=tk.LEFT)
+        make_button(catalog_buttons, "Reset catalog...", lambda: self.reset_catalog_flow(win), "danger").pack(side=tk.LEFT, padx=(10, 0))
 
         tk.Label(body, text="Firebase credentials", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(20, 0))
         key_status = tk.StringVar(value=self.credentials_summary())
@@ -2249,15 +2597,19 @@ class StockTrackerApp:
 
         qr_window = tk.Toplevel(self.root)
         qr_window.title("Connect Mobile Device")
-        qr_window.geometry("720x780")
+        fit_window(qr_window, 720, 780, self.root, min_width=520)
         qr_window.configure(bg="white")
         qr_window.resizable(True, True)
 
         # Keep window on top
         qr_window.attributes('-topmost', True)
 
-        body = tk.Frame(qr_window, bg="white", padx=24, pady=20)
-        body.pack(fill=tk.BOTH, expand=True)
+        # The footer is pinned to the bottom edge; on a short screen only the QR area above it scrolls
+        footer = tk.Frame(qr_window, bg="white", padx=24, pady=12, bd=1, relief=tk.GROOVE)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        scroller = ScrollFrame(qr_window, padx=24, pady=20)
+        scroller.pack(fill=tk.BOTH, expand=True)
+        body = scroller.body
 
         tk.Label(body, text="Connect Mobile", font=(UI_FONT, 16, "bold"), bg="white", fg="#111827").pack(anchor="w")
         tk.Label(
@@ -2387,8 +2739,6 @@ class StockTrackerApp:
             qr_window.destroy()
             self.show_mobile_setup()
 
-        footer = tk.Frame(body, bg="white")
-        footer.pack(fill=tk.X, pady=(14, 0))
         make_button(footer, "Change Firebase Web Config", reset_config, "neutral", padx=12, pady=5).pack(side=tk.LEFT)
         tk.Label(
             footer,
@@ -2443,7 +2793,11 @@ def run_selftest(report_path):
                          "expiry_date TEXT NOT NULL, quantity INTEGER NOT NULL, last_updated TIMESTAMP)")
             conn.commit()
             conn.close()
-            assert ProductCatalog(db).stats()["total"] == 0
+            catalog = ProductCatalog(db)
+            assert catalog.stats()["total"] == 0
+            catalog.add_stock_item("PROBE", 1, "2030-01", "Probe")
+            assert catalog.reset_catalog()["unnamed_kept"] == 1
+            assert catalog.stock_quantity(catalog.resolve("PROBE")[0], "2030-01") == 1
 
     def firebase():
         import grpc  # noqa: F401

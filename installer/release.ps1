@@ -39,7 +39,7 @@ if ($LASTEXITCODE -ne 0) { throw "CHANGELOG.md has no section for version $versi
 Get-Content $notesFile -Encoding UTF8
 
 $signature = "$installer.sig"
-Write-Host "`nReady to publish version $version:" -ForegroundColor Green
+Write-Host "`nReady to publish version ${version}:" -ForegroundColor Green
 Write-Host "  $installer"
 Write-Host "  $signature"
 

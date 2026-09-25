@@ -209,11 +209,18 @@ New scans arrive automatically every 30 seconds, or click **↻ Refresh**.
 | ⚠ Pending scans (N) | Resolve scans that matched more than one product (turns orange when there are some) |
 | ⬇ Export | Save the expiry list as a [PDF or CSV](#exporting-the-expiry-list) |
 | 🕘 History | Browse and export the [stock history](#stock-history) |
-| 🗑 Remove Selected | Delete the selected stock rows |
 | 📱 Connect Mobile | Show the "open the app" and pairing QR codes, and set the phone page address |
-| ⚙ Settings | Expiring-soon window, replace the Firebase key, [check for updates](#updating-the-app) |
+| ⚙ Settings | Expiring-soon window, [replace or reset the product catalog](#replacing-or-resetting-the-catalog), replace the Firebase key, [check for updates](#updating-the-app) |
 | 🛠 Dev Tools | Reset the app to first-run state (keeps your stored Firebase key and the stock history) |
 | ☾ Dark mode / ☀ Light mode | Switch theme. The choice is remembered. |
+
+**Just above the table**
+
+| Button | What it does |
+|---|---|
+| ＋ Add Item (Ctrl+N) | [Add stock by hand](#adding-an-item-by-hand) |
+| 🗑 Remove Selected | Delete the selected stock rows |
+| ↻ Refresh | Fetch new scans now and redraw the table |
 
 **Right-click a row**
 
@@ -224,7 +231,25 @@ New scans arrive automatically every 30 seconds, or click **↻ Refresh**.
   - An edit is refused, with an explanation, if it would give a product the exact item code and alias of another product, or give a product two stock rows with the same expiry.
 - **🗑 Remove selected** works on any number of rows, and asks for confirmation.
 
-Manual edits and removals count as stock changes. That turns off *Undo last import* (see below).
+**Small screens.** Every window fits the space above the taskbar and opens centred on the screen. Its action buttons (Import, Save, Close and so on) are pinned to the bottom edge and always visible. If a window's content is taller than the screen, the content scrolls (scrollbar or mouse wheel) while the buttons stay put. The main window can be resized, and its table shrinks to fit.
+
+Manual adds, edits and removals count as stock changes. That turns off *Undo last change* (see below).
+
+### Adding an item by hand
+
+Use this for stock that didn't come through the phone, for example something you find on a shelf that is close to expiring. Click **＋ Add Item** (or press Ctrl+N).
+
+| Field | Notes |
+|---|---|
+| **Barcode / code** | The barcode (alias) or the item code. As you type, the window tells you whether the catalog knows it. If it does, the product's name is filled in and locked. |
+| **Product name** | Only needed for a code the catalog doesn't know. Enter a name to create a new product, or leave it blank to add the stock as an **(unnamed product)**, the same as an unknown scan. If the code is known only as an unnamed product, entering a name fills it in. |
+| **Expiry (month)** | `2027-03` or `03/2027`. The window shows straight away whether that month counts as good, expiring soon or expired. Years must be 2000 to 2099. |
+| **Quantity** | A whole number, 1 or more. |
+
+- The item is added **exactly like a scan**: if that product already has a row for the same expiry, its quantity goes up. The window shows "4 now, 10 after adding" before you click.
+- If the code matches **several products**, a list appears and you choose which one. Nothing is added until you do.
+- Tick **Keep this window open to add another** to enter a run of items. The expiry stays filled in.
+- The new row is selected in the table. In [History](#stock-history) it appears as **Manual add**, source `desktop`, so it can always be told apart from a scan.
 
 ---
 
@@ -260,9 +285,11 @@ Every change to stock is recorded in a log that can't be edited or deleted from 
 |---|---|
 | `SCAN_ADD` / `SCAN_REMOVE` | A phone scan changed stock (including scans of unknown codes) |
 | `SCAN_HELD` | A scan matched several products and is waiting under Pending scans (no stock change yet) |
+| `MANUAL_ADD` | You added stock with **＋ Add Item** |
 | `EDIT` | You edited a row. The details hold the old and new value of every field that changed. |
 | `REMOVE` | You removed stock rows from the dashboard |
-| `IMPORT` / `IMPORT_UNDO` | A product list was imported, or the last import was undone |
+| `IMPORT` / `IMPORT_UNDO` | A product list was imported, or the last catalog change (import, replace or reset) was undone |
+| `CATALOG_RESET` | The catalog was reset, or replaced from a file (a replace also logs its `IMPORT`). The details hold the counts. |
 | `MERGE` | Stock recorded under an unnamed product was merged into a named one |
 | `BASELINE` | Stock that already existed when history logging started, so the history adds up from day one |
 | `RESET` | **Reset App State** cleared a stock row. The history itself is never cleared. |
@@ -300,7 +327,7 @@ By default a scan only knows its barcode. The catalog teaches the app which barc
 ### The rules
 
 - **A product is identified by its item code + alias pair.** Importing a row with the same pair *updates the description*. A blank description never erases an existing name.
-- **Imports never delete anything.** Products missing from a newer file stay.
+- **Imports never delete anything.** Products missing from a newer file stay. To start over instead, see [Replacing or resetting the catalog](#replacing-or-resetting-the-catalog).
 - **The same code under a different alias becomes a separate product.** Scanning that shared code then asks you to choose (see Pending scans).
 - **Matching ignores case, spaces and leading zeros** in all-digit codes, so a UPC-A code and its EAN-13 form match.
 - **Excel damage is detected:** values like `9.32877E+12` (a barcode Excel shortened) are ignored and counted in the preview. Export your list so barcode cells keep their full digits.
@@ -311,9 +338,29 @@ By default a scan only knows its barcode. The catalog teaches the app which barc
 - **Unknown code:** the stock is recorded under an **(unnamed product)**. When a later import contains that code, the stock is folded into the real product automatically.
 - **A code that matches several products:** the scan waits under **⚠ Pending scans**. Select it, pick the right product by name, and choose **Assign to selected product**. You are asked every time.
 
+### Replacing or resetting the catalog
+
+Both are in **⚙ Settings → Product catalog**. **Stock is never deleted by either.**
+
+| Button | What it does |
+|---|---|
+| **Replace from file…** | The file **becomes the whole catalog**. It uses the same column choice and **Preview changes** as an import, and the preview also shows how many old products will be cleared and how many stock rows match the new file. You confirm before anything changes. |
+| **Reset catalog…** | Clears every product (names, item codes, aliases). You confirm, then type `RESET`. |
+
+What happens to stock that's already recorded:
+
+- Each product with stock stays as an **(unnamed product)** under the barcode its stock was recorded under, exactly as if that code had been scanned before the catalog knew it. Products with no stock are removed.
+- **Replace** then matches that stock to the new file **by barcode** (or item code) automatically, so stock for products that are in the new file gets its name back. Stock for products that aren't in the new file stays unnamed, and the preview tells you how many rows that is.
+- After a **Reset**, importing a product list later matches the stock back up the same way.
+- If two products' stock was recorded under the same barcode, the two are combined into one unnamed product (each combined row is logged as `MERGE`).
+
+Safety: before either one changes anything, the app saves a copy of the database in the `backups` folder next to it (the newest 5 are kept), both are one-step transactions (a failure changes nothing), both are written to the [stock history](#stock-history) as `CATALOG_RESET`, and both can be undone (below). The stock history is never cleared. A replace file with no usable products is refused, because that would only empty the catalog.
+
+The catalog window's own **Import CSV…** is unchanged: it only adds and updates.
+
 ### Undo
 
-**Undo last import** (in the Products window) restores the products and stock to how they were before the most recent import. It works **only until stock next changes** (a scan is applied, a pending scan is resolved, or a row is edited or removed), because restoring older data after that would silently lose stock.
+**Undo last change** (in the Products window) restores the products and stock to how they were before the most recent import, replace or reset. It works **only until stock next changes** (a scan is applied, a pending scan is resolved, or a row is added, edited or removed), because restoring older data after that would silently lose stock. Undoing is itself recorded in the history (`IMPORT_UNDO`), and the history entries of the change stay.
 
 ---
 
@@ -490,7 +537,12 @@ Data stays in the project's `database\` and `config\` folders. Windows is requir
 | Exported CSV shows barcodes like `9.3E+12` in Excel | Export again with **Keep long barcodes and leading zeros intact in Excel** ticked. |
 | Scans arrive but show "(unnamed product)" | The barcode isn't in the catalog yet. Import your product list (Product catalog). |
 | A scan is missing from the table | Check **⚠ Pending scans**: a code matching several products waits there. |
-| **Undo last import** is grayed out | Stock has changed since that import. See [Undo](#undo). |
+| **Undo last change** is grayed out | Stock has changed since that import, replace or reset. See [Undo](#undo). |
+| Add Item: "This code matches several products" | Choose the product from the list that appears under the code box. |
+| Add Item: "Expiry must be a month and year" | Write it as `2027-03` or `03/2027`. |
+| After a reset, everything shows "(unnamed product)" | That's expected: the stock is kept but the names were cleared. Import your product list (or use **Undo last change** right away). |
+| Replace: "This file has no usable products" | Every row lacked both an alias and an item code. Check the column choice. |
+| Replace/Reset: "A safety backup … couldn't be saved" | The `backups` folder next to the database isn't writable or the disk is full. Nothing was changed. |
 | Import preview says values were ignored "as scientific notation" | The spreadsheet damaged the barcodes. Re-export with barcode cells stored as text. |
 | Windows says "Windows protected your PC" | The installer has no paid code-signing certificate. Click **More info → Run anyway**. |
 | Update check: "Couldn't reach GitHub" | No internet, or the network blocks `api.github.com`. Try again later. |
@@ -538,7 +590,8 @@ StockTrackerSystem/
 - **Firebase key on every PC.** Each installation holds an encrypted, Firestore-only service account key. A stronger design would replace it with a sign-in that has no admin power at all, using Firebase Authentication and rules that allow one user to read and delete only scan records. That would be a larger change to how the desktop talks to Firestore.
 - **The phone gets no feedback** when a scan is unknown or ambiguous. That is decided on the desktop and shown there.
 - **One phone-to-PC pairing model:** all phones paired from the same desktop share one token.
-- **Undo covers only the most recent import**, and only until stock next changes.
+- **Undo covers only the most recent catalog change** (import, replace or reset), and only until stock next changes. The safety backup taken before a replace or reset is the fallback after that.
+- **A manually added product isn't linked to a later import automatically** unless the file's row has the same item code and alias pair. A product added by hand has only the alias you typed, so a file that supplies both an alias and an item code for it creates a second product; the two then ask you to choose when scanned.
 - **Updates need public GitHub Releases** and the publisher's signing key. If the repository is made private, the in-app check can't see releases. Copies installed before 1.1.0 have no updater and must be updated by hand once.
 - **History is a log, not an editor.** Entries can't be changed or deleted from the app, only exported. Resetting the app's stock records the reset but keeps earlier history.
 - **Free-plan limits:** Firestore's free tier is generous (tens of thousands of reads and writes per day). This app uses roughly 6,000 reads per day per desktop, so a normal shop won't come close.

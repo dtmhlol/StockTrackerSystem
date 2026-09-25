@@ -215,19 +215,20 @@ def verify(path, version, signature_b64, public_key_b64=None):
 
 # ------------------------------------------------------------ installing
 
-def backup_database(db_path, keep=5):
-    """Copies the database before an update (SQLite's own backup API, safe while open).
-    Keeps the newest `keep` update backups. Returns the backup path."""
+def backup_database(db_path, keep=5, reason="before-update"):
+    """Copies the database into its `backups` folder (SQLite's own backup API, safe while open),
+    named with the time and `reason`. Keeps the newest `keep` backups for that reason.
+    Returns the backup path."""
     folder = os.path.join(os.path.dirname(db_path), "backups")
     os.makedirs(folder, exist_ok=True)
-    target = os.path.join(folder, f"store_inventory-{datetime.now():%Y%m%d-%H%M%S}-before-update.db")
+    target = os.path.join(folder, f"store_inventory-{datetime.now():%Y%m%d-%H%M%S}-{reason}.db")
     source, destination = sqlite3.connect(db_path), sqlite3.connect(target)
     try:
         source.backup(destination)
     finally:
         destination.close()
         source.close()
-    old = sorted(f for f in os.listdir(folder) if f.endswith("-before-update.db"))
+    old = sorted(f for f in os.listdir(folder) if f.endswith(f"-{reason}.db"))
     for name in old[:-keep]:
         try:
             os.remove(os.path.join(folder, name))

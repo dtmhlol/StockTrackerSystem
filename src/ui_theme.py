@@ -96,6 +96,104 @@ def make_button(parent, text, command, kind="primary", **kwargs):
     return tk.Button(parent, **options)
 
 
+_TITLE_BAR = 44      # room a window's title bar and borders take above and around its contents
+
+
+def _work_area(window):
+    """(left, top, right, bottom) of the screen not covered by the taskbar. Falls back to the
+    whole screen minus a typical taskbar where Windows can't say."""
+    if sys.platform == "win32":
+        try:
+            class Rect(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+            rect = Rect()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):   # SPI_GETWORKAREA
+                if rect.right - rect.left > 300 and rect.bottom - rect.top > 200:
+                    return rect.left, rect.top, rect.right, rect.bottom
+        except Exception:
+            pass
+    return 0, 0, window.winfo_screenwidth(), max(240, window.winfo_screenheight() - 48)
+
+
+def fit_window(window, width, height, parent=None, min_width=None, min_height=None):
+    """Sizes a window to width x height, but never larger than the screen can show (the taskbar and
+    the window's own title bar are allowed for), and places it centred over `parent` (or the screen)
+    with every edge on screen. Together with a footer packed to the bottom BEFORE the body, this keeps
+    a dialog's buttons visible on small screens. Returns the (width, height) used."""
+    window.update_idletasks()
+    left, top, right, bottom = _work_area(window)
+    width = min(width, max(320, right - left - 16))
+    height = min(height, max(200, bottom - top - _TITLE_BAR - 8))
+
+    parent = parent or window.master
+    try:
+        if not parent.winfo_viewable():
+            raise tk.TclError
+        x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+    except (tk.TclError, AttributeError):
+        x, y = left + (right - left - width) // 2, top + (bottom - top - height) // 3
+    x = max(left, min(x, right - width - 8))
+    y = max(top + _TITLE_BAR, min(y, bottom - height - 8))     # y is the top of the contents, below the title bar
+    window.geometry(f"{width}x{height}+{x}+{y - _TITLE_BAR}")
+    window.minsize(min(min_width or 360, width), min(min_height or 260, height))
+    return width, height
+
+
+class ScrollFrame(tk.Frame):
+    """A vertically scrolling area for a dialog's content (put widgets in `.body`).
+
+    The scrollbar only appears when the content is taller than the room available, and the mouse
+    wheel scrolls while the pointer is over it. Pack the dialog's footer to the bottom first and this
+    second, so the buttons stay put and only the content scrolls on a small screen."""
+
+    def __init__(self, parent, bg="white", padx=0, pady=0):
+        super().__init__(parent, bg=bg)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self.bar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.bar.set)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.body = tk.Frame(self.canvas, bg=bg, padx=padx, pady=pady)
+        self._window = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self._bar_shown = False
+        self.body.bind("<Configure>", self._sync)
+        self.canvas.bind("<Configure>", self._sync)
+        self.bind("<Enter>", self._grab_wheel)
+        self.bind("<Leave>", self._release_wheel)
+
+    def _sync(self, _event=None):
+        self.canvas.itemconfigure(self._window, width=self.canvas.winfo_width())
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        needed = self.body.winfo_reqheight() > self.canvas.winfo_height() > 1
+        if needed != self._bar_shown:
+            self._bar_shown = needed
+            if needed:
+                self.bar.pack(side=tk.RIGHT, fill=tk.Y)
+            else:
+                self.bar.pack_forget()
+                self.canvas.yview_moveto(0)
+
+    def _grab_wheel(self, _event=None):
+        self.bind_all("<MouseWheel>", self._wheel)
+
+    def _release_wheel(self, event=None):
+        # Leave events also fire when moving onto a child widget; only let go when really outside.
+        if event is not None:
+            inside = self.winfo_containing(event.x_root, event.y_root)
+            while inside is not None:
+                if inside is self:
+                    return
+                inside = getattr(inside, "master", None)
+        self.unbind_all("<MouseWheel>")
+
+    def _wheel(self, event):
+        # Lists and text boxes inside the dialog scroll themselves.
+        if isinstance(event.widget, (tk.Text, tk.Listbox, ttk.Treeview)) or not self._bar_shown:
+            return
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+
 class ThemedScrolledText(tk.Text):
     """A Text with a ttk scrollbar (so it themes like everything else) that
     packs/grids as a single widget, like tkinter.scrolledtext.ScrolledText."""
