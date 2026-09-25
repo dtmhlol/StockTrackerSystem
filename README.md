@@ -1,10 +1,14 @@
+# AI Disclosure
+
+This project was built with the assistance of AI (Claude by Anthropic). The author has reviewed and tested the code and is responsible for it.
+
 # Stock Tracker System
 
-Track stock and expiry dates by scanning barcodes with a phone. Scans go to the cloud, and a Windows desktop app pulls them into a local database, matches each barcode to a named product, and highlights anything expired or about to expire.
+Track stock and expiry dates by scanning barcodes with a phone. Scans go to the cloud, and a Windows desktop app pulls them into a local database, matches each barcode to a named product, and highlights items that are expired or about to expire.
 
 - **Phone:** a web page that scans barcodes with the camera (or takes typed codes).
 - **Cloud:** Google Firebase Firestore passes scans from the phone to the PC. It is free at this scale.
-- **Desktop:** a Windows app that keeps the inventory, product catalog and expiry warnings.
+- **Desktop:** A Windows app that keeps the inventory, product catalogue, and expiry warnings.
 
 ---
 
@@ -40,8 +44,8 @@ flowchart LR
     PC --> DB[("Local SQLite<br/>database")]
 ```
 
-1. On the phone you scan a barcode, choose **Add** or **Remove**, and enter the expiry month and quantity. The page writes one small record to Firestore.
-2. Every 30 seconds the desktop app reads the new records, applies them to its local database, and only *then* deletes them from Firestore. A network failure in between can never lose a scan.
+1. On the phone, you scan a barcode, choose **Add** or **Remove**, and enter the expiry month and quantity. The page writes one small record to Firestore.
+2. Every 30 seconds, the desktop app reads the new records, applies them to its local database, and only *then* deletes them from Firestore. A network failure in between can never lose a scan.
 3. Each scanned code is matched to a product through the **product catalog**, so a product's alias (barcode) and its internal item code both find the same stock.
 4. The phone also sends a "heartbeat", so the desktop shows a green **Mobile connected** indicator while the phone is active.
 
@@ -83,7 +87,7 @@ The rules let the phone *create* scans but never read or change anything.
 
 1. Click the gear icon → **Project settings → General**.
 2. Scroll to **Your apps** and click the web icon `</>`. Give it any nickname and leave **Hosting** unchecked. Click **Register app**.
-3. Copy the `const firebaseConfig = { ... };` block that appears. You will paste it into the desktop app in [Part 4](#part-4---first-run-setup).
+3. Copy the `const firebaseConfig = { ... };` block that appears. Paste it into the desktop app in [Part 4](#part-4---first-run-setup).
    The `apiKey` in it is meant to be public. The rules, not secrecy, protect the database.
 
 ### 1.4 Create a limited service account key (for the desktop)
@@ -92,7 +96,7 @@ The desktop app needs a key to read and clear scans. **Do not use the default "F
 
 1. Open the [Google Cloud console](https://console.cloud.google.com/) and select the same project (top-left project picker).
 2. **IAM & Admin → Service accounts → Create service account**. Name it `stock-tracker-desktop`.
-3. **IAM & Admin → IAM → Grant access**. Enter the new account's email as the principal, give it the role **Cloud Datastore User** (exactly this role), and save.
+3. **IAM & Admin → IAM → Grant access**. Enter the new account's email as the principal, assign the **Cloud Datastore User** role (exactly this role), and save.
    Granting the role on the *IAM* page is what matters. The optional role step in the creation wizard is easy to skip by accident.
 4. Back in **Service accounts**, open the new account and go to **Keys → Add key → Create new key → JSON**. A `.json` file downloads. You will select it in [Part 4](#part-4---first-run-setup).
 5. Wait a minute or two for permissions to spread.
@@ -103,14 +107,14 @@ The desktop app needs a key to read and clear scans. **Do not use the default "F
 
 ## Part 2 - Host the phone page
 
-Phone browsers only allow camera access on **HTTPS** pages, so the page can't just be opened from a file. Host it somewhere free.
+Phone browsers only allow camera access on **HTTPS** pages, so you can't just open the page from a file. Host it somewhere free.
 
 ### Option A - GitHub Pages (recommended)
 
-1. Create a GitHub account and a **new public repository** (for example `StockTrackerSystem`).
+1. Create a GitHub account and a **new public repository** (for example, `StockTrackerSystem`).
 2. Push this project to it. The included [`.gitignore`](.gitignore) keeps your key file, database and other private files out. Check with `git status --ignored` before your first `git add`.
-3. In the repository go to **Settings → Pages**. Set **Source** to **Deploy from a branch**, choose your default branch (`main` or `master`) and `/ (root)`, and save.
-4. After a minute or two the page is live at:
+3. In the repository, go to **Settings → Pages**. Set **Source** to **Deploy from a branch**, choose your default branch (`main` or `master`) and `/ (root)`, and save.
+4. After a minute or two, the page is live at:
 
    ```
    https://<your-username>.github.io/<repository-name>/
@@ -120,7 +124,7 @@ Phone browsers only allow camera access on **HTTPS** pages, so the page can't ju
 
 To publish changes later, commit and push. Pages can take a minute or two to update.
 
-> **Public repositories are visible to everyone.** That's fine here: the page contains no secrets, and the Firebase config reaches a phone only through the pairing QR. Never commit the service account key. If it was ever committed, delete that key in Google Cloud and create a new one.
+> **Public repositories are visible to everyone.** That's fine here: the page contains no secrets, and the Firebase config reaches a phone only through the pairing QR. Never commit the service account key. If you ever committed it, delete that key in Google Cloud and create a new one.
 
 ### Option B - Firebase Hosting
 
@@ -134,13 +138,13 @@ Install [Node.js](https://nodejs.org) and the tools (`npm install -g firebase-to
 
 1. Get `StockTracker-Setup-<version>.exe` (see [Building the installer](#building-the-installer)) and run it.
 2. Windows may show **"Windows protected your PC"** because the installer isn't code-signed. Click **More info → Run anyway**.
-3. It installs for your user account only, with no administrator rights needed. You can choose a desktop shortcut and launch the app at the end.
+3. It installs for your user account only, with no administrator rights needed. You can create a desktop shortcut and launch the app from there.
 
 Updating is the same: run a newer setup file on top. Your data is kept.
 
 ### Uninstalling
 
-Use **Settings → Apps → Stock Tracker → Uninstall**. It asks whether to delete your stock data and saved credentials as well. Choose **No** if you might reinstall.
+Use **Settings → Apps → Stock Tracker → Uninstall**. It asks whether to delete your stock data and saved credentials. Choose **No** if you might reinstall.
 
 ---
 
@@ -148,11 +152,11 @@ Use **Settings → Apps → Stock Tracker → Uninstall**. It asks whether to de
 
 The first time the app opens, a setup window appears.
 
-1. **Firebase Service Account Key:** click **Choose key file…** and select the `.json` key from step 1.4.
+1. **Firebase Service Account Key:** Click **Choose key file…** and select the `.json` key from step 1.4.
    - The app tests the key against Firestore, then asks you to confirm. The confirmation shows the project and account name, never the key itself.
    - It then encrypts the key for your Windows account and offers to delete the original file. Say **Yes**.
 2. **Firebase Web Config:** paste the `const firebaseConfig = { ... };` block from step 1.3. Pasting it exactly as the console shows it is fine.
-3. **Expiring-soon warning:** choose **30, 60 or 90 days**. Stock expiring inside that window is highlighted yellow. You can change this later in **⚙ Settings**.
+3. **Expiring-soon warning:** choose **30, 60 or 90 days**. Stock expiring within that window is highlighted yellow. You can change this later in **⚙ Settings**.
 4. Click **Test Connection** to check everything, then **Save and Open Dashboard**.
 
 If the app finds an old plain-text `service_account.json`, it offers to encrypt it and delete the plain file.
@@ -162,15 +166,15 @@ If the app finds an old plain-text `service_account.json`, it offers to encrypt 
 ## Part 5 - Pair the phone
 
 1. On the desktop, click **📱 Connect Mobile**. The window shows two QR codes side by side.
-2. **Check the phone page address.** The **Phone page address** field is pre-filled with `https://dtmhlol.github.io/StockTrackerSystem/`, the page hosted for this project, so normally there is nothing to do. If you host your own copy (Part 2), replace it with your address and click **Save**; the app remembers it. It must start with `https://`, because phone browsers only allow the camera on secure pages.
+2. **Check the phone page address.** The **Phone page address** field is pre-filled with `https://dtmhlol.github.io/StockTrackerSystem/`, the page hosted for this project, so you usually don't need to do anything. If you host your own copy (Part 2), replace it with your address and click **Save**; the app remembers it. It must start with `https://`, because phone browsers only allow the camera on secure pages.
    To change the built-in default for your own builds, edit `DEFAULT_MOBILE_APP_URL` in [`src/app_paths.py`](src/app_paths.py).
-3. **QR 1, "Open the app":** scan it with the phone's normal camera app. It opens the scanner page in the phone's browser, so nobody has to type the address.
-   Prefer Chrome or Safari over the built-in browser of another app.
+3. **QR 1, "Open the app":** Scan it with the phone's normal camera app. It opens the scanner page in the phone's browser, so nobody has to type the address.
+   Prefer Chrome or Safari over another app's built-in browser.
 4. Allow camera access when the page asks.
-5. **QR 2, "Pair with this PC":** on the page's "Scan Desktop QR to Connect" screen, scan the second code.
-6. The page changes to the scanner and shows **Connected** at the top. Within about 30 seconds the desktop's indicator turns green: **● Mobile connected**.
+5. **QR 2, "Pair with this PC":** On the page's "Scan Desktop QR to Connect" screen, scan the second code.
+6. The page changes to the scanner and shows **Connected** at the top. Within about 30 seconds, the desktop's indicator turns green: **● Mobile connected**.
 
-**Copy address** and **Copy pairing details** under the codes copy the same information as text, for sending to a phone by message.
+**Copy address** and **Copy pairing details** under the codes copy the same information as text, so you can send it to a phone by message.
 
 If the camera won't work, take a screenshot of the pairing QR on the desktop, send it to the phone, and tap **Scan an Image File** on the page. Pairing needs no camera that way.
 
@@ -182,12 +186,12 @@ Pairing is remembered per web address on the phone. Pair once using the final ad
 
 ### On the phone
 
-1. Scan a barcode with the camera, or type it in **Or enter manually**.
+1. Scan a barcode with the camera, or type it in **Or enter it manually**.
 2. Choose **Add to Stock** or **Remove (Expired/Damaged)**.
 3. Set the **Expiry** month and the **Quantity**.
 4. Tap **Sync to Queue**. The entry appears under **Recent Syncs**.
 
-The sun/moon button in the header switches light and dark mode. Under **Troubleshooting** there is a **Run connection test** button (see [Troubleshooting](#troubleshooting)).
+The sun/moon button in the header switches light and dark mode. Under **Troubleshooting**, there is a **Run connection test** button (see [Troubleshooting](#troubleshooting)).
 
 ### On the desktop
 
@@ -224,32 +228,32 @@ New scans arrive automatically every 30 seconds, or click **↻ Refresh**.
 
 **Right-click a row**
 
-- **✎ Edit information…** is available when exactly **one** row is selected, and grayed out when several are.
+- **✎ Edit information…** is available when exactly **one** row is selected, and greyed out when several are.
   - *Name, Alias / barcode and Item code* belong to the product, so they change **everywhere** that product appears.
   - *Expiry* (`YYYY-MM`) and *Quantity* change only that stock row.
-  - Before anything is saved you see exactly what will change and must confirm.
+  - Before anything is saved, you see exactly what will change and must confirm.
   - An edit is refused, with an explanation, if it would give a product the exact item code and alias of another product, or give a product two stock rows with the same expiry.
 - **🗑 Remove selected** works on any number of rows, and asks for confirmation.
 
-**Small screens.** Every window fits the space above the taskbar and opens centred on the screen. Its action buttons (Import, Save, Close and so on) are pinned to the bottom edge and always visible. If a window's content is taller than the screen, the content scrolls (scrollbar or mouse wheel) while the buttons stay put. The main window can be resized, and its table shrinks to fit.
+**Small screens.** Every window fits the space above the taskbar and opens centred on the screen. Its action buttons (Import, Save, Close and so on) are pinned to the bottom edge and always visible. If a window's content is taller than the screen, the content scrolls (scrollbar or mouse wheel) while the buttons stay put. You can resize the main window, and its table shrinks to fit.
 
-Manual adds, edits and removals count as stock changes. That turns off *Undo last change* (see below).
+Manual adds, edits, and removals count as stock changes. That turns off *Undo last change* (see below).
 
 ### Adding an item by hand
 
-Use this for stock that didn't come through the phone, for example something you find on a shelf that is close to expiring. Click **＋ Add Item** (or press Ctrl+N).
+Use this for stock that didn't come through the phone, for example, something you find on a shelf that is close to expiring. Click **＋ Add Item** (or press Ctrl+N).
 
 | Field | Notes |
 |---|---|
-| **Barcode / code** | The barcode (alias) or the item code. As you type, the window tells you whether the catalog knows it. If it does, the product's name is filled in and locked. |
-| **Product name** | Only needed for a code the catalog doesn't know. Enter a name to create a new product, or leave it blank to add the stock as an **(unnamed product)**, the same as an unknown scan. If the code is known only as an unnamed product, entering a name fills it in. |
-| **Expiry (month)** | `2027-03` or `03/2027`. The window shows straight away whether that month counts as good, expiring soon or expired. Years must be 2000 to 2099. |
+| **Barcode/code** | The barcode (alias) or the item code. As you type, the window tells you whether the catalogue knows it. If it does, the product name fills in and locks. |
+| **Product name** | Only needed for a code the catalogue doesn't know. Enter a name to create a new product, or leave it blank to add the stock as an **(unnamed product)**, the same as an unknown scan. If the code is known only as an unnamed product, entering a name fills it in. |
+| **Expiry (month)** | `2027-03` or `03/2027`. The window shows immediately whether that month counts as good, expiring soon, or expired. Years must be 2000 to 2099. |
 | **Quantity** | A whole number, 1 or more. |
 
 - The item is added **exactly like a scan**: if that product already has a row for the same expiry, its quantity goes up. The window shows "4 now, 10 after adding" before you click.
-- If the code matches **several products**, a list appears and you choose which one. Nothing is added until you do.
+- If the code matches **several products**, a list appears, and you choose which one. Nothing is added until you do.
 - Tick **Keep this window open to add another** to enter a run of items. The expiry stays filled in.
-- The new row is selected in the table. In [History](#stock-history) it appears as **Manual add**, source `desktop`, so it can always be told apart from a scan.
+- The new row is selected in the table. In [History](#stock-history), it appears as **Manual add**, source `desktop`, so it can always be told apart from a scan.
 
 ---
 
@@ -267,9 +271,9 @@ Click **⬇ Export** on the dashboard to save the expiry list as a **PDF** (for 
 
 A line at the bottom of the filters always tells you how many items and units will be exported, and warns you if the choices match nothing. Then click **Export**, choose where to save it, and the app offers to open the file.
 
-**The PDF** is landscape A4 with a title, the filters and sort used, a summary of expired / expiring / good counts, and the table. Rows are shaded by status, column headings repeat on every page, and every page is numbered ("Page 2 of 5").
+**The PDF** is landscape A4 and includes a title, the filters and sort used, a summary of expired/expiring/good counts, and the table. Rows are shaded by status, column headings repeat on every page, and every page is numbered ("Page 2 of 5").
 
-**The CSV** opens in Excel with accents intact. Tick **Keep long barcodes and leading zeros intact in Excel** (on by default) and codes such as `0123456` or `9300675057899` display exactly as they are instead of turning into `9.3E+12`. Untick it for plain CSV, for example to import the file into another system. When you group, the CSV gets an extra **Group** column.
+**The CSV** opens in Excel with accents intact. Tick **Keep long barcodes and leading zeros intact in Excel** (on by default) and codes such as `0123456` or `9300675057899` display exactly as they are instead of turning into `9.3E+12`. Untick it for plain CSV, for example, to import the file into another system. When you group, the CSV gets an extra **Group** column.
 
 **What "expired" means.** The dashboard and the export use the same rule. Stock is counted from the **first day** of its expiry month, so stock stamped with the current month already counts as expired, and "expiring soon" means within your chosen 30/60/90-day window. The rule lives in one function, `status_for` in [`src/expiry_report.py`](src/expiry_report.py), if you ever want it to count to the end of the month instead.
 
@@ -277,7 +281,7 @@ A line at the bottom of the filters always tells you how many items and units wi
 
 ## Stock history
 
-Every change to stock is recorded in a log that can't be edited or deleted from the app, so it is a reliable record and a good source for analysis. Click **🕘 History** on the dashboard.
+Every stock change is recorded in a log that can't be edited or deleted from the app, so it is a reliable record and a good source for analysis. Click **🕘 History** on the dashboard.
 
 **What is recorded** (one row per event, saved in the same step as the change itself, so the log can never disagree with the stock):
 
@@ -286,7 +290,7 @@ Every change to stock is recorded in a log that can't be edited or deleted from 
 | `SCAN_ADD` / `SCAN_REMOVE` | A phone scan changed stock (including scans of unknown codes) |
 | `SCAN_HELD` | A scan matched several products and is waiting under Pending scans (no stock change yet) |
 | `MANUAL_ADD` | You added stock with **＋ Add Item** |
-| `EDIT` | You edited a row. The details hold the old and new value of every field that changed. |
+| `EDIT` | You edited a row. The details hold the old and new values of every field that changed. |
 | `REMOVE` | You removed stock rows from the dashboard |
 | `IMPORT` / `IMPORT_UNDO` | A product list was imported, or the last catalog change (import, replace or reset) was undone |
 | `CATALOG_RESET` | The catalog was reset, or replaced from a file (a replace also logs its `IMPORT`). The details hold the counts. |
@@ -295,9 +299,9 @@ Every change to stock is recorded in a log that can't be edited or deleted from 
 | `RESET` | **Reset App State** cleared a stock row. The history itself is never cleared. |
 | `SYSTEM` | A setting changed, the Firebase key was replaced, or an update was started (never the key itself) |
 
-Each event stores when it happened (local time with the UTC offset), the product's name, alias and item code **as they were at that moment** (so later renames don't rewrite the past), the code that was scanned, the expiry, the change, the quantity before and after, the phone's own clock for scans, and a note. A removal larger than the stock on hand is cleared to zero and the note records the shortfall.
+Each event stores when it happened (local time with the UTC offset), the product's name, alias and item code **as they were at that moment** (so later renames don't rewrite the past), the code that was scanned, the expiry, the change, the quantity before and after, the phone's own clock for scans, and a note. A removal larger than the stock on hand is cleared to zero, and the note records the shortfall.
 
-**In the History window** you can filter by date range (with Today / Last 7 days / Last 30 days / All time shortcuts), by event type, and by searching product name, alias, item code, code scanned or note. The table shows the newest 500 matches; select an event to see its full details.
+**In the History window**, you can filter by date range (with Today / Last 7 days / Last 30 days / All time shortcuts), by event type, and by searching product name, alias, item code, code scanned or note. The table shows the newest 500 matches; select an event to see its full details.
 
 **Export CSV…** saves **every** matching event (not just the 500 shown), oldest first, as UTF-8 with a header row. It is built for analysis: stable event codes such as `SCAN_ADD`, plain numeric columns, ISO timestamps, and a `Details (JSON)` column for edits and imports. Barcodes are written as plain values; tick **Excel-friendly barcodes** only if you will open the file in Excel and need leading zeros kept.
 
@@ -315,13 +319,13 @@ The history is stored in the same database file as your stock, so backing up the
 
 ## Product catalog
 
-By default a scan only knows its barcode. The catalog teaches the app which barcode belongs to which named product, and lets both a product's **alias** (barcode) and its **item code** find the same stock.
+By default, a scan only knows its barcode. The catalog teaches the app which barcode belongs to which named product, and lets both a product's **alias** (barcode) and its **item code** find the same stock.
 
 ### Importing a product list
 
-1. Click **📦 Products → Import CSV…** and choose your file (comma, tab, semicolon or pipe separated).
+1. Click **📦 Products → Import CSV…** and choose your file (comma-, tab-, semicolon-, or pipe-separated).
 2. **Choose which column is which:** Alias (barcode), Item Code (internal SKU) and Item Description (product name). Column names and order can differ from file to file. The app pre-selects likely columns and remembers your choice for files with the same headers.
-3. Click **Preview changes**. You see counts of new products, renamed products and anything skipped, plus samples. Nothing has changed yet.
+3. Click **Preview changes**. You see counts of new products, renamed products, and anything skipped, plus samples. Nothing has changed yet.
 4. Click **Import**.
 
 ### The rules
@@ -330,12 +334,12 @@ By default a scan only knows its barcode. The catalog teaches the app which barc
 - **Imports never delete anything.** Products missing from a newer file stay. To start over instead, see [Replacing or resetting the catalog](#replacing-or-resetting-the-catalog).
 - **The same code under a different alias becomes a separate product.** Scanning that shared code then asks you to choose (see Pending scans).
 - **Matching ignores case, spaces and leading zeros** in all-digit codes, so a UPC-A code and its EAN-13 form match.
-- **Excel damage is detected:** values like `9.32877E+12` (a barcode Excel shortened) are ignored and counted in the preview. Export your list so barcode cells keep their full digits.
+- **Excel damage is detected:** values like `9.32877E+12` (a barcode Excel shortened) are ignored and not counted in the preview. Export your list so barcode cells keep their full digits.
 - Rows with neither an alias nor an item code are skipped.
 
 ### Scans the catalog can't place
 
-- **Unknown code:** the stock is recorded under an **(unnamed product)**. When a later import contains that code, the stock is folded into the real product automatically.
+- **Unknown code:** the stock is recorded under an **(unnamed product)**. When a later import includes that code, the stock is automatically folded into the real product.
 - **A code that matches several products:** the scan waits under **⚠ Pending scans**. Select it, pick the right product by name, and choose **Assign to selected product**. You are asked every time.
 
 ### Replacing or resetting the catalog
@@ -360,7 +364,7 @@ The catalog window's own **Import CSV…** is unchanged: it only adds and update
 
 ### Undo
 
-**Undo last change** (in the Products window) restores the products and stock to how they were before the most recent import, replace or reset. It works **only until stock next changes** (a scan is applied, a pending scan is resolved, or a row is added, edited or removed), because restoring older data after that would silently lose stock. Undoing is itself recorded in the history (`IMPORT_UNDO`), and the history entries of the change stay.
+**Undo last change** (in the Products window) restores the products and stock to how they were before the most recent import, replace or reset. It works **only until stock next changes** (a scan is applied, a pending scan is resolved, or a row is added, edited or removed), because restoring older data after that would silently lose stock. Undoing is also recorded in the history (`IMPORT_UNDO`), and the history entries for the change remain.
 
 ---
 
@@ -391,7 +395,7 @@ To move to another PC: install the app there, then run first-run setup again. Th
 
 | What | How it is protected |
 |---|---|
-| The service account key | Encrypted with Windows data protection for your account. Not shown in the app. Can only be added or replaced through the app, with a confirmation. |
+| The service account key | Encrypted with Windows data protection for your account. Not shown in the app. You can only add or replace it through the app, with confirmation. |
 | Its power | Limited to Firestore by the **Cloud Datastore User** role. |
 | The phone | Can only *create* scan records and a heartbeat. It can't read, change or delete anything. |
 | The Firebase web config | Public by design. It identifies the project but grants no access beyond the rules. |
@@ -408,13 +412,13 @@ Be aware of these limits:
 
 ## Updating the app
 
-**Settings → Check for updates** looks at this project's [GitHub Releases](https://github.com/dtmhlol/StockTrackerSystem/releases) (only when you click it; the app never contacts the internet for updates on its own). If you're current it says so. If a newer version exists it shows **what's new** and an **Install update** button.
+**Settings → Check for updates** looks at this project's [GitHub Releases](https://github.com/dtmhlol/StockTrackerSystem/releases) (only when you click it; the app never contacts the internet for updates on its own). If you're up to date, it says so. If a newer version exists, it shows **what's new** and an **Install update** button.
 
 **Install update** does this, with no Python or manual download needed on the PC:
 
 1. Asks you to confirm, then saves a backup of your database.
 2. Downloads the release's Windows installer from GitHub (with a progress bar and a Cancel button).
-3. **Verifies its signature.** The installer is only accepted if it was signed with the publisher's private key, which matches the public key built into your app. A tampered file, a file signed by anyone else, or an older signed installer passed off as newer is refused, deleted, and never run.
+3. **Verifies its signature.** The installer is only accepted if it was signed with the publisher's private key, which matches the public key built into your app. The installer refuses, deletes, and never runs tampered files, files signed by anyone else, or older installers passed off as newer.
 4. Closes the app, runs the installer silently, and reopens the app by itself. Your data stays in place.
 
 The installed app updates in place. Nothing is installed if the check fails, and the message says why:
@@ -428,7 +432,7 @@ The installed app updates in place. Nothing is installed if the check fails, and
 
 **Running from source?** The check works, but installing is only for the installed app. Update a source checkout with `git pull`.
 
-**Database safety.** The app records the version of its database format. If you open a database from a newer version, it refuses with "Update Stock Tracker to the latest version" instead of misreading it. Upgrading an older database takes a one-time backup first (see [Backups](#backups)).
+**Database safety.** The app records the version of its database format. If you open a database from a newer version, it refuses with "Update Stock Tracker to the latest version" instead of misreading it. Upgrading an older database requires a one-time backup first (see [Backups](#backups)).
 
 ---
 
@@ -470,7 +474,7 @@ python installer\release_tools.py init-key
 
 This creates a private key in `%USERPROFILE%\.stocktracker\release-signing-key.pem` (outside the project, so it can't be committed) and prints the matching public key, which goes into `UPDATE_PUBLIC_KEY` in [`src/app_paths.py`](src/app_paths.py). That is already done for this project.
 
-> **Back the private key up somewhere safe and private** (for example a password manager), and never share it. Whoever holds it can publish updates that every installed copy will accept. If it is lost, installed copies can't be updated automatically again until they are reinstalled by hand with a build containing a new public key.
+> **Back up the private key somewhere safe and private** (for example, in a password manager), and never share it. Whoever holds it can publish updates that every installed copy will accept. If it is lost, installed copies can't update automatically again until you reinstall them by hand with a build containing a new public key.
 
 **For each release:**
 
@@ -482,9 +486,9 @@ This creates a private key in `%USERPROFILE%\.stocktracker\release-signing-key.p
    ```
 
    This builds the app and installer, signs it (producing `StockTracker-Setup-x.y.z.exe.sig`), checks the signature against the key built into the app, and saves the notes.
-3. Publish. Either add `-Publish` to the command above (needs the [GitHub CLI](https://cli.github.com/): `winget install GitHub.cli`, then `gh auth login`), or do it in the browser: open `https://github.com/dtmhlol/StockTrackerSystem/releases/new`, create the tag `vx.y.z`, paste the notes, and attach **both** files from `installer\Output`: the `.exe` and the `.exe.sig`. Without the `.sig` the app cannot install the update automatically.
+3. Publish. Either add `-Publish` to the command above (needs the [GitHub CLI](https://cli.github.com/): `winget install GitHub.cli`, then `gh auth login`), or do it in the browser: open `https://github.com/dtmhlol/StockTrackerSystem/releases/new`, create the tag `vx.y.z`, paste the notes, and attach **both** files from `installer\Output`: the `.exe` and the `.exe.sig`. Without the `.sig`, the app cannot install the update automatically.
 
-The tag must look like `v1.2.0`. The updater compares it with the installed version, so it only offers releases that are newer. GitHub's **latest release** is used, so leave drafts and pre-releases unmarked as "latest".
+The tag must look like `v1.2.0`. The updater compares it with the installed version, so it offers only newer releases. GitHub uses the **latest release**, so leave drafts and pre-releases unmarked as "latest".
 
 **Testing the update path safely:** never test installers or uninstallers against your real installation or data. Build a test variant with its own app ID (`/DTestBuild` in `installer\StockTracker.iss`) and point `LOCALAPPDATA` at a temporary folder.
 
@@ -528,19 +532,19 @@ Data stays in the project's `database\` and `config\` folders. Windows is requir
 | Problem | Fix |
 |---|---|
 | "**Cloud Firestore API has not been used… or it is disabled**" | Create the database in the Firebase console (step 1.1). Wait a few minutes. |
-| Key import: "**403 Missing or insufficient permissions**" | The new service account lacks the role. Grant **Cloud Datastore User** on the IAM page (step 1.4), wait a minute, and import again. Nothing was changed by the failed attempt. |
+| Key import: "**403 Missing or insufficient permissions**" | The new service account lacks the role. Grant **Cloud Datastore User** on the IAM page (step 1.4), wait a minute, and import again. The failed attempt changed nothing. |
 | Web config is rejected | Paste the whole `firebaseConfig` block. Placeholder values like `"..."` are refused. |
 | "The stored Firebase credentials can't be decrypted" | The key was saved under a different Windows account or PC. Use **⚙ Settings → Replace key file…** (or the setup window) and import it again. |
-| The **Mobile connected** indicator stays grey | It checks every 30 seconds and shows connected only if the phone sent a heartbeat in the last 2 minutes. A locked or backgrounded phone pauses its page, so keep the page open. Confirm pairing shows **Connected** on the phone. |
+| The **Mobile connected** indicator stays grey | It checks every 30 seconds and shows connected only if the phone sent a heartbeat in the last 2 minutes. A locked or backgrounded phone pauses its page, so keep the page open. Confirm pairing by checking that the phone shows **Connected**. |
 | Export: "PDF export needs the 'reportlab' package" | Only when running from source: `python -m pip install -r requirements.txt`. Installed builds include it. |
-| Export: "Is the file open in another program?" | The report file is open in Excel or a PDF viewer. Close it, or save under a different name. |
+| Export: "Is the file open in another program?" | The report file is open in Excel or a PDF viewer. Close it, or save it under a different name. |
 | Exported CSV shows barcodes like `9.3E+12` in Excel | Export again with **Keep long barcodes and leading zeros intact in Excel** ticked. |
 | Scans arrive but show "(unnamed product)" | The barcode isn't in the catalog yet. Import your product list (Product catalog). |
 | A scan is missing from the table | Check **⚠ Pending scans**: a code matching several products waits there. |
-| **Undo last change** is grayed out | Stock has changed since that import, replace or reset. See [Undo](#undo). |
+| **Undo last change** is greyed out | Stock has changed since that import; replace or reset. See [Undo](#undo). |
 | Add Item: "This code matches several products" | Choose the product from the list that appears under the code box. |
 | Add Item: "Expiry must be a month and year" | Write it as `2027-03` or `03/2027`. |
-| After a reset, everything shows "(unnamed product)" | That's expected: the stock is kept but the names were cleared. Import your product list (or use **Undo last change** right away). |
+| After a reset, everything shows "(unnamed product)" | That's expected: the stock is kept, but the names were cleared. Import your product list (or use **Undo last change** right away). |
 | Replace: "This file has no usable products" | Every row lacked both an alias and an item code. Check the column choice. |
 | Replace/Reset: "A safety backup … couldn't be saved" | The `backups` folder next to the database isn't writable or the disk is full. Nothing was changed. |
 | Import preview says values were ignored "as scientific notation" | The spreadsheet damaged the barcodes. Re-export with barcode cells stored as text. |
@@ -548,7 +552,7 @@ Data stays in the project's `database\` and `config\` folders. Windows is requir
 | Update check: "Couldn't reach GitHub" | No internet, or the network blocks `api.github.com`. Try again later. |
 | Update check: "No releases have been published yet" | Nothing has been published on the repository's Releases page. |
 | Update: "signature" or "checksum" error | The download was damaged or doesn't come from the publisher's key. Nothing was installed. Retry, or use **Open release page** and ask the publisher. |
-| "This database was created by a newer version of Stock Tracker" | An older copy of the app is pointing at data written by a newer one. Install the newer version rather than downgrading. The app refuses to open it so nothing is damaged. |
+| "This database was created by a newer version of Stock Tracker" | An older copy of the app is pointing at data written by a newer one. Install the newer version rather than downgrading. The app refuses to open it, so nothing is damaged. |
 | **History** is empty for old stock | Changes made before version 1.1.0 weren't recorded. Existing stock appears as a single **Baseline** entry from the day of the upgrade. |
 | The app closed unexpectedly | Look at `%LOCALAPPDATA%\StockTracker\error.log` for the details. |
 
@@ -587,8 +591,8 @@ StockTrackerSystem/
 ## Known limitations
 
 - **Windows only** for the desktop app.
-- **Firebase key on every PC.** Each installation holds an encrypted, Firestore-only service account key. A stronger design would replace it with a sign-in that has no admin power at all, using Firebase Authentication and rules that allow one user to read and delete only scan records. That would be a larger change to how the desktop talks to Firestore.
-- **The phone gets no feedback** when a scan is unknown or ambiguous. That is decided on the desktop and shown there.
+- **Firebase key on every PC.** Each installation holds an encrypted, Firestore-only service account key. A stronger design would replace it with a sign-in that has no admin power, using Firebase Authentication and rules that allow one user to read and delete only scan records. That would be a larger change to how the desktop talks to Firestore.
+- **The phone gets no feedback** when a scan is unknown or ambiguous. The desktop decides that and shows it there.
 - **One phone-to-PC pairing model:** all phones paired from the same desktop share one token.
 - **Undo covers only the most recent catalog change** (import, replace or reset), and only until stock next changes. The safety backup taken before a replace or reset is the fallback after that.
 - **A manually added product isn't linked to a later import automatically** unless the file's row has the same item code and alias pair. A product added by hand has only the alias you typed, so a file that supplies both an alias and an item code for it creates a second product; the two then ask you to choose when scanned.
