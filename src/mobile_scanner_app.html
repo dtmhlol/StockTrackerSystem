@@ -87,7 +87,13 @@
                 <svg class="w-12 h-12 text-slate-400 dark:text-slate-500" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 8.5A2.5 2.5 0 015.5 6h1.6l1.2-1.8A1.5 1.5 0 019.55 3.5h4.9a1.5 1.5 0 011.25.7L16.9 6h1.6A2.5 2.5 0 0121 8.5v9a2.5 2.5 0 01-2.5 2.5h-13A2.5 2.5 0 013 17.5v-9z"/><circle cx="12" cy="12.5" r="3.5"/></svg>
                 <p id="camera-status" class="text-sm text-slate-500 dark:text-slate-400 max-w-[18rem]"></p>
             </div>
-            <div id="reader" class="mb-3 hidden"></div>
+            <div id="reader-wrap" class="relative mb-3 hidden">
+                <div id="reader"></div>
+                <!-- Shown after a successful scan while decoding is on hold (the video keeps running). -->
+                <div id="scan-locked" class="hidden absolute inset-0 z-10 flex items-center justify-center p-6 text-center bg-black/55 text-white text-sm font-semibold rounded-2xl pointer-events-none">
+                    Scanned. Tap Scan again for the next item.
+                </div>
+            </div>
 
             <div class="flex gap-2 mb-4">
                 <button id="camera-btn" type="button" class="btn-primary">Start camera</button>
@@ -188,7 +194,8 @@
         const disconnectBtn = document.getElementById('disconnect-btn');
 
         // Camera controls
-        const readerEl = document.getElementById('reader');
+        const readerWrap = document.getElementById('reader-wrap');
+        const scanLockedEl = document.getElementById('scan-locked');
         const cameraPlaceholder = document.getElementById('camera-placeholder');
         const cameraStatus = document.getElementById('camera-status');
         const cameraBtn = document.getElementById('camera-btn');
@@ -215,15 +222,34 @@
         // straight from a tap with facingMode "environment" gives one prompt and
         // the rear camera on iOS, Android and desktop (desktop falls back to
         // its only webcam).
+        //
+        // iOS notes:
+        // - The library's pause()/resume() pauses and replays the <video>
+        //   element. On WebKit that replay is unreliable: the feed can freeze
+        //   or the scanner can stay stuck in PAUSED, so scanning silently stops
+        //   after a few items. Instead the camera and decoder keep running and
+        //   results are simply ignored while `scanLocked` is set.
+        // - iOS has no BarcodeDetector, so decoding runs in JavaScript (ZXing).
+        //   Limiting the formats and skipping the mirrored retry makes each
+        //   frame much cheaper, which keeps it responsive and the phone cooler.
+        // - Websites can't trigger or tune autofocus on iOS. On newer iPhones
+        //   (Pro models especially) the main lens can't focus closer than about
+        //   15–20 cm, so a barcode held close stays blurry. A little zoom lets
+        //   you hold the phone further back, where it can focus.
         // ---------------------------------------------------------------
         const SCANNER_STATE = window.Html5QrcodeScannerState || { NOT_STARTED: 1, SCANNING: 2, PAUSED: 3 };
         const CAMERA_PREF_KEY = 'STOCK_TRACKER_CAMERA_ID';
+        const BARCODE_ZOOM = 2;               // applied only where the browser supports zoom
+        const SAME_CODE_COOLDOWN_MS = 2000;   // ignore the same barcode briefly after "Scan again"
 
         let scanner = null;
         let cameras = [];            // filled after the first successful start (labels need permission)
         let currentCameraId = null;
         let cameraWanted = false;    // the user wants the camera on; used to restart it after backgrounding
         let cameraBusy = false;
+        let scanLocked = false;      // a code was just read; ignore results until the user moves on
+        let lastCode = null;
+        let lastCodeAt = 0;
 
         function scannerState() {
             try {
@@ -240,12 +266,31 @@
 
         const LIBRARY_MISSING_MESSAGE = "The barcode scanner couldn't load. Check the internet connection (or any content blocker) and reload the page. You can still type barcodes manually.";
 
+        function scannerOptions() {
+            const options = {
+                verbose: false,
+                // Uses the fast native detector on Android/Chrome; iOS falls back to ZXing.
+                useBarCodeDetectorIfSupported: true,
+                experimentalFeatures: { useBarCodeDetectorIfSupported: true }
+            };
+            const F = window.Html5QrcodeSupportedFormats;
+            if (F) {
+                // QR for the pairing code, plus common retail/carton barcodes.
+                // Add F.DATA_MATRIX here if you scan pharmacy (GS1 DataMatrix) packs.
+                options.formatsToSupport = [
+                    F.QR_CODE, F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E,
+                    F.CODE_128, F.CODE_39, F.ITF
+                ];
+            }
+            return options;
+        }
+
         // Creates the scanner the first time it's needed. Returns null if the
         // html5-qrcode library failed to load, instead of crashing the page.
         function ensureScanner() {
             if (scanner) return scanner;
             if (typeof Html5Qrcode === 'undefined') return null;
-            scanner = new Html5Qrcode("reader", /* verbose= */ false);
+            scanner = new Html5Qrcode("reader", scannerOptions());
             return scanner;
         }
 
@@ -262,8 +307,20 @@
             return { width, height };
         }
 
-        function scanConfig() {
-            return { fps: 10, aspectRatio: 1.0, qrbox: isSetupMode ? squareBox : wideBox };
+        function scanConfig(deviceId) {
+            return {
+                fps: 10,
+                qrbox: isSetupMode ? squareBox : wideBox,
+                // The rear camera isn't mirrored, so don't spend a second decode
+                // attempt on a flipped copy of every frame.
+                disableFlip: true,
+                // Ask for a decent resolution explicitly; left to itself WebKit
+                // may pick a small stream, which hurts thin 1D barcodes.
+                videoConstraints: Object.assign(
+                    deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'environment' },
+                    { aspectRatio: { ideal: 1 }, width: { ideal: 1080 }, height: { ideal: 1080 } }
+                )
+            };
         }
 
         function defaultCameraHint() {
@@ -281,18 +338,19 @@
 
         function renderCameraControls() {
             const running = cameraRunning();
-            const paused = scannerState() === SCANNER_STATE.PAUSED;
+            const locked = running && scanLocked;
             const showVideo = running || cameraBusy;
 
-            readerEl.classList.toggle('hidden', !showVideo);
+            readerWrap.classList.toggle('hidden', !showVideo);
             cameraPlaceholder.classList.toggle('hidden', showVideo);
+            scanLockedEl.classList.toggle('hidden', !locked);
 
             cameraBtn.disabled = cameraBusy;
             cameraBtn.textContent = cameraBusy ? 'Starting camera…'
-                : paused ? 'Scan again'
+                : locked ? 'Scan again'
                 : running ? 'Stop camera'
                 : 'Start camera';
-            cameraBtn.className = (running && !paused) ? 'btn-secondary' : 'btn-primary';
+            cameraBtn.className = (running && !locked) ? 'btn-secondary' : 'btn-primary';
 
             switchCameraBtn.classList.toggle('hidden', !(running && cameras.length > 1));
             switchCameraBtn.disabled = cameraBusy;
@@ -318,6 +376,21 @@
             return `Couldn't start the camera: ${text}`;
         }
 
+        // Zoom in a little for product barcodes so the phone can be held far
+        // enough back to focus. Silently does nothing where zoom isn't exposed.
+        async function applyZoom() {
+            try {
+                const zoom = scanner.getRunningTrackCameraCapabilities().zoomFeature();
+                if (!zoom.isSupported()) return;
+                const target = isSetupMode
+                    ? zoom.min()
+                    : Math.min(zoom.max(), Math.max(zoom.min(), BARCODE_ZOOM));
+                await zoom.apply(target);
+            } catch (e) {
+                // Zoom not supported on this browser/camera.
+            }
+        }
+
         async function startCamera(deviceId) {
             if (cameraBusy) return;
             if (!ensureScanner()) {
@@ -326,6 +399,7 @@
                 return;
             }
             cameraBusy = true;
+            scanLocked = false;
             setCameraStatus('');
             renderCameraControls();
 
@@ -339,14 +413,14 @@
                 }
 
                 try {
-                    await scanner.start(deviceId || { facingMode: 'environment' }, scanConfig(), onScanSuccess, onScanFailure);
+                    await scanner.start(deviceId || { facingMode: 'environment' }, scanConfig(deviceId), onScanSuccess, onScanFailure);
                 } catch (error) {
                     // A saved camera ID can go stale (some browsers change IDs
                     // between sessions). Forget it and fall back to the rear camera.
                     if (!deviceId) throw error;
                     localStorage.removeItem(CAMERA_PREF_KEY);
                     deviceId = null;
-                    await scanner.start({ facingMode: 'environment' }, scanConfig(), onScanSuccess, onScanFailure);
+                    await scanner.start({ facingMode: 'environment' }, scanConfig(null), onScanSuccess, onScanFailure);
                 }
 
                 cameraWanted = true;
@@ -355,6 +429,8 @@
                 } catch (e) {
                     currentCameraId = deviceId;
                 }
+
+                applyZoom();
 
                 // Camera names are only available once permission is granted.
                 if (!cameras.length) {
@@ -382,6 +458,7 @@
                     console.warn('Camera stop failed:', error);
                 }
             }
+            scanLocked = false;
             renderCameraControls();
         }
 
@@ -398,21 +475,18 @@
             }
         }
 
-        function pauseScanning() {
-            if (scannerState() === SCANNER_STATE.SCANNING) {
-                try {
-                    scanner.pause(true);
-                } catch (e) {}
-            }
+        // Hold further results without touching the video (see iOS notes above).
+        function lockScanning() {
+            scanLocked = true;
             renderCameraControls();
         }
 
-        function resumeScanning() {
-            if (scannerState() === SCANNER_STATE.PAUSED) {
-                try {
-                    scanner.resume();
-                } catch (e) {}
-            }
+        function unlockScanning() {
+            if (!scanLocked) return;
+            scanLocked = false;
+            // Start the same-code cooldown now, so a barcode still in view
+            // isn't read again the instant scanning resumes.
+            lastCodeAt = Date.now();
             renderCameraControls();
         }
 
@@ -434,10 +508,9 @@
 
         cameraBtn.addEventListener('click', () => {
             if (cameraBusy) return;
-            const state = scannerState();
-            if (state === SCANNER_STATE.PAUSED) {
-                resumeScanning();
-            } else if (state === SCANNER_STATE.SCANNING) {
+            if (cameraRunning() && scanLocked) {
+                unlockScanning();
+            } else if (cameraRunning()) {
                 cameraWanted = false;
                 stopCamera();
             } else {
@@ -577,11 +650,16 @@
         }
         
         function onScanSuccess(decodedText, decodedResult) {
-            // Ignore extra frames decoded after we've already paused.
-            if (scannerState() !== SCANNER_STATE.SCANNING) return;
+            // Ignore frames decoded while a previous result is being handled.
+            if (scanLocked || cameraBusy) return;
 
-            // Pause once we get a result to prevent double scans; "Scan again" or a sync resumes it.
-            pauseScanning();
+            const now = Date.now();
+            if (decodedText === lastCode && now - lastCodeAt < SAME_CODE_COOLDOWN_MS) return;
+            lastCode = decodedText;
+            lastCodeAt = now;
+
+            // Hold results once we get one to prevent double scans; "Scan again" or a sync releases it.
+            lockScanning();
             
             if (isSetupMode) {
                 let parsedConfig = null;
@@ -601,11 +679,11 @@
                     updateUIState();
                     startHeartbeat();
                     showToast('Connected to Firestore.', 'success');
-                    // Restart with the wide barcode scan box.
+                    // Restart with the wide barcode scan box and zoom.
                     setTimeout(() => startCamera(), 1500);
                 } else {
                     showToast('Invalid QR Code. Scan the desktop setup QR that contains the connection details.', 'error');
-                    setTimeout(resumeScanning, 2000);
+                    setTimeout(unlockScanning, 2000);
                 }
                 return;
             }
@@ -703,8 +781,8 @@
                 barcodeInput.value = '';
                 document.getElementById('quantity').value = '1';
                 
-                // Resume scanner if it was paused
-                resumeScanning();
+                // Ready for the next scan
+                unlockScanning();
 
             } catch (error) {
                 console.error("Sync failed:", error);
@@ -799,7 +877,7 @@
                 CONNECTION_TOKEN = "";
                 isSetupMode = true;
                 updateUIState();
-                // Restart with the square scan box for the pairing QR.
+                // Restart with the square scan box (and no zoom) for the pairing QR.
                 if (cameraRunning()) startCamera();
                 showToast("Device disconnected.", "info");
             }
