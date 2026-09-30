@@ -224,6 +224,11 @@
         // its only webcam).
         //
         // iOS notes:
+        // - WebKit allows only one active camera capture per page. Opening a
+        //   second getUserMedia stream mutes/ends the first one, leaving a black
+        //   feed while the green camera indicator stays on. That's why cameras
+        //   are listed with enumerateDevices() rather than Html5Qrcode.getCameras()
+        //   (which opens its own stream to check permission).
         // - The library's pause()/resume() pauses and replays the <video>
         //   element. On WebKit that replay is unreliable: the feed can freeze
         //   or the scanner can stay stuck in PAUSED, so scanning silently stops
@@ -391,6 +396,18 @@
             }
         }
 
+        // Lists cameras without opening a new stream. Only call this once the
+        // scanner's stream is running (permission granted), otherwise labels
+        // come back empty. Html5Qrcode.getCameras() is deliberately not used:
+        // it calls getUserMedia itself, which on iOS kills the scanner's feed.
+        async function listCameras() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            return devices
+                .filter(device => device.kind === 'videoinput')
+                .map(device => ({ id: device.deviceId, label: device.label }));
+        }
+
         async function startCamera(deviceId) {
             if (cameraBusy) return;
             if (!ensureScanner()) {
@@ -435,7 +452,7 @@
                 // Camera names are only available once permission is granted.
                 if (!cameras.length) {
                     try {
-                        cameras = await Html5Qrcode.getCameras();
+                        cameras = await listCameras();
                     } catch (e) {
                         cameras = [];
                     }
