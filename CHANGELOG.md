@@ -3,6 +3,24 @@
 All notable changes to Stock Tracker. Each release's section is used as its GitHub release notes,
 which the in-app updater shows before installing. Newest first.
 
+## [1.1.3] - 2026-10-13
+
+### Added
+- **Expiry alerts.** Stock that is expired or expiring soon now shows in a new **Actions** tab on the dashboard, most urgent first (the longest expired at the top). A Windows notification such as "5 actions to review: 2 expired, 3 expiring soon" appears when the app starts and once a day (default 9:00, changeable in Settings). Clicking it opens a pop-up with the same list.
+- Each item has an **Actions** menu: **Dismiss for 3 days** (it returns by itself, or sooner if its expiry is edited), **Remove product** (asks first and is recorded in History), or **Edit...**.
+- **Runs in the background.** Closing the window now keeps Stock Tracker running in the system tray, so phone scans keep syncing and reminders keep coming. Right-click the tray icon to open it or quit. Turn this off in Settings to make the close button quit.
+- **Start with Windows.** A new Settings option, and an installer option (off by default), start Stock Tracker hidden in the tray when you sign in.
+- Only one copy runs at a time; opening the shortcut again brings the running one back.
+
+### Changed
+- The dashboard table is now the **Inventory** tab next to **Actions**. The selected tab is larger than the others.
+
+### Fixed
+- **The window could freeze ("Not Responding") at start-up** when Firebase was slow or rejected the saved key. Contacting Firebase no longer blocks the window: scans are fetched in the background, a failure shows **Sync unavailable** in the status pill, and the next attempt is a few minutes later. Replacing a key that Firebase rejects now says so instead of hanging.
+
+### Upgrading from 1.1.2
+Use **Settings -> Check for updates**. Your data is kept, and the database format is unchanged.
+
 ## [1.1.2] - 2026-09-26
 
 ### Added

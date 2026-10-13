@@ -13,23 +13,30 @@ import queue
 import random
 import string
 import threading
+import time
 from urllib.parse import urlparse
 
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore as admin_firestore
 
+import actions
 import app_paths
 import expiry_report
 import secure_store
+import startup
 import stock_history
 import updater
+from actions_view import ActionsView
+from single_instance import SingleInstance
+from tray import TrayIcon
 from product_catalog import (
     ProductCatalog, DatabaseTooNewError, PLACEHOLDER_LABEL, MAPPING_FIELDS, read_table, guess_mapping,
     validate_mapping, parse_rows, format_import_summary, expiry_from_text,
 )
 from ui_theme import (
     ThemeManager, ThemedScrolledText, ScrollFrame, UI_FONT, fit_window, make_button, system_prefers_dark,
+    work_area,
 )
 
 # Dashboard label and row colour for each status code from expiry_report.status_for
@@ -43,6 +50,8 @@ TREE_STATUS = {
 # Stock expiring within this many days is highlighted as "expiring soon".
 WARNING_DAY_PRESETS = (30, 60, 90)
 DEFAULT_WARNING_DAYS = 60
+DEFAULT_NOTIFY_HOUR = 9
+SYNC_TIMEOUT_SECONDS = 20
 
 QR_AVAILABLE = importlib.util.find_spec("qrcode") is not None and importlib.util.find_spec("PIL") is not None
 
@@ -151,7 +160,7 @@ def normalize_mobile_url(text):
 
 
 class StockTrackerApp:
-    def __init__(self, root):
+    def __init__(self, root, single=None):
         self.root = root
         self.root.title("Stock Tracker - Manager Dashboard")
         self.root.geometry(f"1040x{min(660, max(400, self.root.winfo_screenheight() - 100))}")
@@ -171,6 +180,17 @@ class StockTrackerApp:
         self.history_window = None
         self.add_item_window = None
         self.expiry_warning_days = DEFAULT_WARNING_DAYS
+        self.tray = None
+        self.ui_queue = queue.Queue()
+        self.notebook = None
+        self.actions_view = None
+        self.actions_popup = None
+        self.actions_popup_view = None
+        self.quitting = False
+        self.single = single
+        self.sync_worker = None
+        self.presence_worker = None
+        self.sync_paused_until = 0
 
         # init_db() must run first — it creates the settings table that
         # load_or_create_connection_token() reads from and writes to.
@@ -206,6 +226,7 @@ class StockTrackerApp:
             self.root.withdraw()
 
         self.root.after(600, self.offer_credential_migration)
+        self.setup_background()
 
     def init_db(self):
         """Ensures the database and required tables exist before launching the UI."""
@@ -366,7 +387,22 @@ class StockTrackerApp:
             firebase_admin.initialize_app(credentials.Certificate(info))
             db = admin_firestore.client()
             if verify:
-                db.collection("presence").limit(1).get()
+                # A key Firebase rejects makes this read retry forever, so bound the wait.
+                outcome = {}
+
+                def probe():
+                    try:
+                        db.collection("presence").limit(1).get()
+                    except Exception as e:
+                        outcome["error"] = e
+
+                worker = threading.Thread(target=probe, daemon=True)
+                worker.start()
+                worker.join(SYNC_TIMEOUT_SECONDS)
+                if worker.is_alive():
+                    raise RuntimeError(self.explain_sync_timeout_for(info))
+                if "error" in outcome:
+                    raise outcome["error"]
             self.db = db
             return True, "Connected."
         except Exception as e:
@@ -541,14 +577,16 @@ class StockTrackerApp:
         except Exception:
             return None
 
-    def check_mobile_connection(self):
+    def check_mobile_connection(self, db=None):
         """Checks the presence doc the mobile app's heartbeat writes to, to
-        see whether the mobile app is currently active."""
-        if not self.db:
+        see whether the mobile app is currently active. Makes a network call, so it
+        must not run on the Tk thread (see update_connection_status_label)."""
+        db = db or self.db
+        if not db:
             return False
 
         try:
-            doc = self.db.collection('presence').document(self.connection_token).get()
+            doc = db.collection('presence').document(self.connection_token).get()
             if not doc.exists:
                 return False
             last_seen = (doc.to_dict() or {}).get('lastSeen')
@@ -560,8 +598,34 @@ class StockTrackerApp:
             return False
 
     def update_connection_status_label(self):
-        """Refreshes the live connection label in the dashboard."""
-        connected = self.check_mobile_connection()
+        """Refreshes the live connection label in the dashboard. The network check runs on a
+        worker thread and the label is updated on the Tk thread when it answers (or after
+        a timeout), so a slow or rejected connection can never freeze the window."""
+        if self.presence_worker is not None and self.presence_worker.is_alive():
+            return
+        db = self.db
+        outcome = {}
+
+        def work():
+            outcome["connected"] = self.check_mobile_connection(db)
+
+        self.presence_worker = threading.Thread(target=work, daemon=True, name="presence-check")
+        self.presence_worker.start()
+        deadline = time.time() + SYNC_TIMEOUT_SECONDS
+
+        def wait():
+            if self.quitting:
+                return
+            if self.presence_worker.is_alive() and time.time() < deadline:
+                self.root.after(100, wait)
+                return
+            self.show_connection_status(outcome.get("connected", False))
+
+        self.root.after(100, wait)
+
+    def show_connection_status(self, connected):
+        if time.time() < self.sync_paused_until and not connected:
+            return   # a failed sync already says "Sync unavailable"
         if connected:
             self.connection_status_var.set("●  Mobile connected")
             colors = {"bg": "#dcfce7", "fg": "#166534"}
@@ -571,31 +635,85 @@ class StockTrackerApp:
         if self.status_pill is not None:
             self.theme.set_colors(self.status_pill, **colors)
 
+    def explain_sync_timeout(self):
+        return self.explain_sync_timeout_for(self.credentials_info)
+
+    def explain_sync_timeout_for(self, info):
+        """Why a Firestore read hung: usually Firebase rejecting the key."""
+        try:
+            from google.oauth2 import service_account
+            from google.auth.transport import requests as google_requests
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/datastore"])
+            creds.refresh(google_requests.Request())
+        except Exception as e:
+            return ("Firebase rejected the stored key (" + str(e).split(",")[0].strip("(' ") + "). It was probably "
+                    "deleted or replaced in the Firebase console. Create a new key under Project settings > "
+                    "Service accounts and replace it in Settings > Firebase credentials.")
+        return "Firebase did not answer in time. Check the internet connection."
+
     def sync_from_firestore(self, silent=False):
         """
-        Pulls any unsynced scan documents from Firestore, applies them to
-        the local `inventory` table, then deletes them remotely. Docs are
-        only ever deleted AFTER the local SQLite commit has succeeded, so a
-        network failure between read and delete can at worst cause a scan
-        to be re-applied once (harmless double count in a rare failure
-        case) rather than lost.
+        Pulls any unsynced scan documents from Firestore, applies them to the local `inventory`
+        table, then deletes them remotely. Docs are only ever deleted AFTER the local SQLite
+        commit has succeeded, so a network failure between read and delete can at worst cause a
+        scan to be re-applied once (harmless double count in a rare failure case) rather than lost.
+
+        The network read runs on a worker thread and its result is applied back on the Tk thread,
+        so the window never freezes (a key Firebase rejects makes the client retry forever). This
+        returns at once; the dashboard refreshes itself when new scans have been applied.
         """
-        if not self.db:
-            return False
+        if not self.db or self.quitting:
+            return
+        # After a failure, background syncs pause for a few minutes instead of retrying every 30 s.
+        if silent and time.time() < self.sync_paused_until:
+            return
+        if self.sync_worker is not None and self.sync_worker.is_alive():
+            return
 
-        try:
-            docs = list(
-                self.db.collection('scans')
-                .where('token', '==', self.connection_token)
-                .stream()
-            )
-        except Exception as e:
-            if not silent:
-                messagebox.showerror("Sync Failed", f"Could not fetch new scans: {e}")
-            return False
+        result = {}
+        db, token = self.db, self.connection_token
 
+        def work():
+            try:
+                result["docs"] = list(db.collection('scans').where('token', '==', token).stream())
+            except Exception as e:
+                result["error"] = e
+
+        self.sync_worker = threading.Thread(target=work, daemon=True, name="firestore-sync")
+        self.sync_worker.start()
+        deadline = time.time() + SYNC_TIMEOUT_SECONDS
+
+        def wait():
+            if self.quitting:
+                return
+            if self.sync_worker.is_alive() and time.time() < deadline:
+                self.root.after(100, wait)
+                return
+            if "docs" in result:
+                self.finish_sync(result["docs"], silent)
+            elif "error" in result:
+                self.sync_failed(f"Could not fetch new scans: {result['error']}", silent)
+            else:
+                # Still waiting: find out why on another thread (it also may take a moment)
+                def diagnose():
+                    message = self.explain_sync_timeout()
+                    self.ui_queue.put(lambda: self.sync_failed(message, silent))
+                threading.Thread(target=diagnose, daemon=True).start()
+
+        self.root.after(100, wait)
+
+    def sync_failed(self, message, silent):
+        self.sync_paused_until = time.time() + 300
+        self.connection_status_var.set("!  Sync unavailable")
+        if not silent and not self.quitting:
+            messagebox.showerror("Sync Failed", message)
+
+    def finish_sync(self, docs, silent):
+        """Applies fetched scans to the local database (on the Tk thread), then clears them remotely."""
+        self.sync_paused_until = 0
         if not docs:
-            return True
+            return
 
         conn = None
         try:
@@ -633,27 +751,30 @@ class StockTrackerApp:
             self.catalog.reload_index()
             if not silent:
                 messagebox.showerror("Sync Failed", f"Could not save new scans locally: {e}")
-            return False
+            return
         finally:
             if conn is not None:
                 conn.close()
 
         # Only clear the docs from Firestore now that they're safely committed locally.
-        try:
-            batch = self.db.batch()
-            for doc in docs:
-                batch.delete(doc.reference)
-            batch.commit()
-        except Exception as e:
-            if not silent:
-                messagebox.showwarning(
-                    "Partial Sync",
-                    f"New scans were saved locally, but couldn't clear them from "
-                    f"Firestore: {e}. They'll simply be re-applied next sync, "
-                    "which is safe unless it keeps failing repeatedly."
-                )
+        # The delete is a network call too, so it also runs off the Tk thread.
+        db = self.db
 
-        return True
+        def clear_remote():
+            try:
+                batch = db.batch()
+                for doc in docs:
+                    batch.delete(doc.reference)
+                batch.commit()
+            except Exception as e:
+                if not silent:
+                    detail = (f"New scans were saved locally, but couldn't clear them from Firestore: {e}. "
+                              "They'll simply be re-applied next sync, which is safe unless it keeps "
+                              "failing repeatedly.")
+                    self.ui_queue.put(lambda: messagebox.showwarning("Partial Sync", detail))
+
+        threading.Thread(target=clear_remote, daemon=True, name="firestore-clear").start()
+        self.refresh_data(run_sync=False)
 
     def start_connection_polling(self):
         """Starts periodic polling of the mobile connection status, and pulls
@@ -691,6 +812,7 @@ class StockTrackerApp:
 
             self.setup_completed = False
             messagebox.showinfo("Reset Complete", "The app has been reset to its default state. Restarting setup now.")
+            self.release_for_restart()
             self.root.destroy()
             if app_paths.is_frozen():
                 os.execl(sys.executable, sys.executable)
@@ -1023,9 +1145,17 @@ class StockTrackerApp:
                                           fg="#eab308", font=(UI_FONT, 10, "bold"), bg="#f3f4f6")
         self.legend_soon_label.pack(side=tk.LEFT)
 
+        # Two tabs: the stock table, and the stock that needs attention
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=28, pady=(12, 0))
+
         # Inventory table, in a bordered card
-        card = tk.Frame(self.root, bg="#ffffff", relief=tk.SOLID, bd=1)
-        card.pack(fill=tk.BOTH, expand=True, padx=28, pady=(12, 0))
+        card = tk.Frame(self.notebook, bg="#ffffff", relief=tk.SOLID, bd=1)
+        self.notebook.add(card, text="  Inventory  ")
+        actions_tab = tk.Frame(self.notebook, bg="#ffffff")
+        self.notebook.add(actions_tab, text="  Actions  ")
+        self.actions_view = ActionsView(actions_tab, self, padx=16)
+        self.actions_view.pack(fill=tk.BOTH, expand=True)
 
         tree_scroll = ttk.Scrollbar(card)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1100,6 +1230,7 @@ class StockTrackerApp:
             messagebox.showerror("Error", f"Failed to load data: {e}")
 
         self.update_pending_badge()
+        self.refresh_actions()
 
     def update_pending_badge(self):
         """Shows how many scans are waiting for the user to pick a product."""
@@ -1132,6 +1263,204 @@ class StockTrackerApp:
                 
             except Exception as e:
                 messagebox.showerror("Database Error", f"Failed to delete items: {e}")
+
+    # ------------------------------------------------------------ actions, tray, background
+
+    def setting_on(self, key, default=True):
+        value = self.get_setting(key)
+        return default if value is None else value == "1"
+
+    def notify_hour(self):
+        try:
+            return min(23, max(0, int(self.get_setting("notify_hour") or DEFAULT_NOTIFY_HOUR)))
+        except ValueError:
+            return DEFAULT_NOTIFY_HOUR
+
+    def tray_image(self):
+        """The tray icon picture: the app icon, or a plain square if the icon file is missing."""
+        from PIL import Image
+        try:
+            image = Image.open(app_paths.resource_path("app.ico"))
+            image.load()
+            return image.convert("RGBA")
+        except Exception:
+            return Image.new("RGBA", (64, 64), "#3b82f6")
+
+    def setup_background(self):
+        """Starts the tray icon and the daily check, and hides the window on a background launch."""
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.tray = TrayIcon(
+            self.tray_image(), self.ui_queue.put,
+            on_open=self.show_main_window, on_actions=self.show_actions_popup,
+            on_quit=self.quit_app, on_notification_click=self.show_actions_popup,
+        )
+        self.tray.start()
+        self.root.after(250, self.process_ui_queue)
+
+        if self.single is not None:
+            self.single.listen(
+                on_show=lambda: self.ui_queue.put(self.show_main_window),
+                on_quit=lambda: self.ui_queue.put(self.quit_app),
+            )
+
+        if not self.setup_completed:
+            return
+        if "--background" in sys.argv and self.tray.available:
+            self.root.withdraw()
+        self.root.after(3000, self.notify_actions)
+        self.root.after(60000, self.daily_check)
+
+    def process_ui_queue(self):
+        """Runs work that other threads (tray, second launch) asked for, on the Tk thread."""
+        try:
+            while True:
+                callback = self.ui_queue.get_nowait()
+                try:
+                    callback()
+                except Exception:
+                    log_exception(*sys.exc_info())
+        except queue.Empty:
+            pass
+        if not self.quitting:
+            self.root.after(250, self.process_ui_queue)
+
+    def show_main_window(self):
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.focus_force()
+
+    def on_close(self):
+        """The window's X button: hide to the tray, or quit, depending on the setting."""
+        if self.setting_on("run_in_background", True) and self.tray is not None and self.tray.available:
+            self.root.withdraw()
+            if not self.setting_on("tray_hint_shown", False):
+                self.save_setting("tray_hint_shown", "1")
+                self.tray.notify("Stock Tracker is still running",
+                                 "It keeps syncing in the background. Right-click the tray icon to quit, "
+                                 "or change this in Settings.")
+        else:
+            self.quit_app()
+
+    def quit_app(self):
+        if self.quitting:
+            return
+        self.quitting = True
+        if self.tray is not None:
+            self.tray.stop()
+        self.root.destroy()
+
+    def release_for_restart(self):
+        """Lets go of the tray icon and the single-instance lock before the app restarts itself."""
+        if self.tray is not None:
+            self.tray.stop()
+        if self.single is not None:
+            self.single.release()
+
+    # -- the Actions list ---------------------------------------------------
+
+    def refresh_actions(self):
+        """Redraws every place the actions list is shown and updates the tab's count."""
+        if self.actions_view is None:
+            return
+        items = self.actions_view.refresh()
+        count = len(items)
+        try:
+            self.notebook.tab(1, text=f"  Actions ({count})  " if count else "  Actions  ")
+        except tk.TclError:
+            pass
+        if self.actions_popup is not None and self.actions_popup.winfo_exists():
+            self.actions_popup_view.refresh()
+
+    def snooze_action(self, item):
+        if actions.snooze(self.db_path, [item["id"]]):
+            self.catalog.log_system_event(
+                f"Dismissed {item['product']} ({item['expiry']}) from the Actions list for {actions.SNOOZE_DAYS} days.",
+                {"inventory_id": item["id"], "expiry": item["expiry"], "days": actions.SNOOZE_DAYS})
+        self.refresh_actions()
+
+    def remove_action(self, item):
+        popup_open = self.actions_popup is not None and self.actions_popup.winfo_exists()
+        parent = self.actions_popup if popup_open else self.root
+        if not messagebox.askyesno(
+            "Remove product",
+            f"Permanently remove {item['product']} ({expiry_report.format_month(item['expiry'])}, "
+            f"quantity {item['quantity']}) from inventory?\n\nThis is recorded in History.",
+            parent=parent,
+        ):
+            return
+        try:
+            self.catalog.remove_stock_rows(
+                [item["id"]], note=f"Removed from the Actions list ({actions.describe_timing(item).lower()}).")
+        except Exception as e:
+            messagebox.showerror("Database Error", f"Failed to remove the item: {e}", parent=parent)
+            return
+        self.refresh_data(run_sync=False)
+
+    def edit_action(self, item):
+        self.show_main_window()
+        self.open_edit_dialog(item["id"])
+
+    def show_actions_popup(self):
+        """The pop-up list: opened from the notification, the tray menu or the dashboard."""
+        if self.actions_popup is not None and self.actions_popup.winfo_exists():
+            self.actions_popup.deiconify()
+            self.actions_popup.lift()
+            self.actions_popup_view.refresh()
+            return
+
+        win = tk.Toplevel(self.root)
+        self.actions_popup = win
+        win.title("Stock Tracker - Actions")
+        win.configure(bg="#ffffff")
+        win.attributes("-topmost", True)
+        width, height = fit_window(win, 520, 560, None, min_width=420, min_height=320)
+        # Sit in the bottom-right corner just above the taskbar, like a notification
+        _left, _top, right, bottom = work_area(win)
+        win.geometry(f"{width}x{height}+{right - width - 16}+{bottom - height - 52}")
+
+        footer = tk.Frame(win, bg="#ffffff", padx=16, pady=12, bd=1, relief=tk.GROOVE)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        make_button(footer, "Open Stock Tracker", self.open_actions_tab, "primary").pack(side=tk.LEFT)
+        make_button(footer, "Close", win.destroy, "neutral").pack(side=tk.RIGHT)
+
+        self.actions_popup_view = ActionsView(win, self, padx=16)
+        self.actions_popup_view.pack(fill=tk.BOTH, expand=True)
+        self.actions_popup_view.refresh()
+        self.theme.style(win)
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+    def open_actions_tab(self):
+        self.show_main_window()
+        self.notebook.select(1)
+
+    def notify_actions(self):
+        """Sends the Windows notification if anything needs attention (rows dismissed for now are
+        not counted). Falls back to the pop-up if there is no tray. Returns True if it alerted."""
+        if not self.setup_completed or self.quitting or not self.setting_on("notify_enabled", True):
+            return False
+        try:
+            items, _snoozed = actions.load_actions(self.db_path, self.expiry_warning_days)
+        except Exception:
+            return False
+        self.save_setting("last_action_notice", datetime.now().strftime("%Y-%m-%d"))
+        if not items:
+            return False
+        title, message = actions.notification_text(items)
+        if self.tray is not None and self.tray.notify(title, message):
+            return True
+        self.show_actions_popup()
+        return True
+
+    def daily_check(self):
+        """Once a day, at or after the chosen hour, while the app is running."""
+        try:
+            now = datetime.now()
+            if now.hour >= self.notify_hour() and self.get_setting("last_action_notice") != now.strftime("%Y-%m-%d"):
+                self.notify_actions()
+        finally:
+            if not self.quitting:
+                self.root.after(60000, self.daily_check)
 
     def open_catalog_window(self):
         """Lists the product catalog and lets the user import or update it from a CSV file."""
@@ -2547,6 +2876,34 @@ class StockTrackerApp:
         combo.set(f"{self.expiry_warning_days} days")
         combo.pack(anchor="w")
 
+        tk.Label(body, text="Background and notifications", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(20, 0))
+        background_var = tk.BooleanVar(value=self.setting_on("run_in_background", True))
+        notify_var = tk.BooleanVar(value=self.setting_on("notify_enabled", True))
+        startup_var = tk.BooleanVar(value=startup.is_enabled())
+
+        def check(text, variable, state=tk.NORMAL):
+            box = tk.Checkbutton(body, text=text, variable=variable, state=state, bg="white", fg="#111827",
+                                 font=(UI_FONT, 10), bd=0, highlightthickness=0, anchor="w", justify=tk.LEFT,
+                                 wraplength=400)
+            box.pack(anchor="w", pady=(6, 0))
+            return box
+
+        check("Keep running in the system tray when the window is closed", background_var)
+        tk.Label(body, text="Syncing and notifications continue. Quit from the tray icon's menu.",
+                 font=(UI_FONT, 9), bg="white", fg="#6b7280", wraplength=400, justify=tk.LEFT).pack(anchor="w", padx=(24, 0))
+        check("Notify me when stock is expiring or has expired", notify_var)
+        hour_row = tk.Frame(body, bg="white")
+        hour_row.pack(anchor="w", padx=(24, 0), pady=(4, 0))
+        tk.Label(hour_row, text="Daily reminder at", font=(UI_FONT, 9), bg="white", fg="#6b7280").pack(side=tk.LEFT, padx=(0, 8))
+        hour_combo = ttk.Combobox(hour_row, state="readonly", width=7, values=[f"{h:02d}:00" for h in range(5, 23)])
+        hour_combo.set(f"{self.notify_hour():02d}:00")
+        hour_combo.pack(side=tk.LEFT)
+        check("Start Stock Tracker when I sign in to Windows", startup_var,
+              tk.NORMAL if startup.supported() else tk.DISABLED)
+        if not startup.supported():
+            tk.Label(body, text="Only available in the installed app.", font=(UI_FONT, 9), bg="white",
+                     fg="#6b7280").pack(anchor="w", padx=(24, 0))
+
         tk.Label(body, text="Product catalog", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(20, 0))
         tk.Label(body, text="Start over with a new product list. Stock on hand is always kept and matched back up by "
                             "barcode. A backup is saved first, and it can be undone until stock next changes.",
@@ -2563,6 +2920,12 @@ class StockTrackerApp:
 
         def save():
             self.set_warning_days(int(combo.get().split()[0]))
+            self.save_setting("run_in_background", "1" if background_var.get() else "0")
+            self.save_setting("notify_enabled", "1" if notify_var.get() else "0")
+            self.save_setting("notify_hour", str(int(hour_combo.get().split(":")[0])))
+            if startup.supported() and startup_var.get() != startup.is_enabled():
+                if not startup.set_enabled(startup_var.get()):
+                    messagebox.showwarning("Start with Windows", "Windows would not let the app change its startup setting.", parent=win)
             win.destroy()
 
         tk.Label(body, text="Updates", font=(UI_FONT, 10, "bold"), bg="white", fg="#111827").pack(anchor="w", pady=(20, 0))
@@ -2799,6 +3162,30 @@ def run_selftest(report_path):
             assert catalog.reset_catalog()["unnamed_kept"] == 1
             assert catalog.stock_quantity(catalog.resolve("PROBE")[0], "2030-01") == 1
 
+    def expiry_actions():
+        import tempfile
+        import pystray  # noqa: F401  (the tray icon library must be in the package)
+        with tempfile.TemporaryDirectory() as folder:
+            db = os.path.join(folder, "t.db")
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, barcode TEXT NOT NULL, "
+                         "expiry_date TEXT NOT NULL, quantity INTEGER NOT NULL, last_updated TIMESTAMP)")
+            conn.commit()
+            conn.close()
+            catalog = ProductCatalog(db)
+            now = datetime(2026, 10, 13)
+            for code, expiry in (("A", "2026-08"), ("B", "2026-09"), ("C", "2026-11"), ("D", "2030-01")):
+                catalog.add_stock_item(code, 1, expiry, f"Item {code}")
+            items, snoozed = actions.load_actions(db, 60, now)
+            assert [i["product"] for i in items] == ["Item A", "Item B", "Item C"], items   # longest expired first
+            assert actions.counts(items) == {"total": 3, "expired": 2, "expiring_soon": 1}
+            assert "3 actions" in actions.summary_sentence(items)
+            assert actions.snooze(db, [items[0]["id"]], now=now) == 1
+            items, snoozed = actions.load_actions(db, 60, now)
+            assert len(items) == 2 and snoozed == 1
+            items, snoozed = actions.load_actions(db, 60, datetime(2026, 10, 17))   # snooze over
+            assert len(items) == 3 and snoozed == 0
+
     def firebase():
         import grpc  # noqa: F401
         from cryptography.hazmat.primitives import serialization
@@ -2857,6 +3244,7 @@ def run_selftest(report_path):
     step("qrcode + Pillow", qr_libs)
     step("Windows key protection", dpapi)
     step("product catalog + sqlite", catalog)
+    step("expiry actions + tray library", expiry_actions)
     step("Firebase Admin SDK + Firestore client", firebase)
 
     with open(report_path, "w", encoding="utf-8") as report:
@@ -2869,6 +3257,22 @@ if __name__ == "__main__":
         sys.exit(run_selftest(sys.argv[sys.argv.index("--selftest") + 1]))
 
     sys.excepthook = log_exception
+
+    # One copy at a time: the app keeps running in the tray, so a second launch (shortcut, startup
+    # entry) wakes the running copy instead of starting another. --quit asks it to exit (the
+    # installer uses this before replacing files). Only the packaged app does this.
+    single = None
+    if app_paths.is_frozen():
+        single = SingleInstance()
+        if not single.acquire():
+            if "--quit" in sys.argv:
+                single.signal_running_copy(quit_it=True)
+            elif "--background" not in sys.argv:
+                single.signal_running_copy()
+            sys.exit(0)
+        if "--quit" in sys.argv:
+            sys.exit(0)           # nothing was running, so nothing to quit
+
     root = tk.Tk()
     try:
         root.iconbitmap(default=app_paths.resource_path("app.ico"))
@@ -2884,8 +3288,9 @@ if __name__ == "__main__":
 
     root.report_callback_exception = report_callback_exception
 
+    app = None
     try:
-        app = StockTrackerApp(root)
+        app = StockTrackerApp(root, single)
         root.mainloop()
     except DatabaseTooNewError as e:
         messagebox.showerror("Update Stock Tracker", str(e))
@@ -2894,3 +3299,6 @@ if __name__ == "__main__":
         log_exception(*sys.exc_info())
         messagebox.showerror("Stock Tracker could not start", f"Details were saved to:\n{app_paths.log_path()}")
         raise
+    finally:
+        if app is not None and app.tray is not None:
+            app.tray.stop()      # its thread would otherwise keep the process alive

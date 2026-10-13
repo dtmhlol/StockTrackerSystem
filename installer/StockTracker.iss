@@ -11,11 +11,13 @@
   #define AppName "Stock Tracker E2E TEST"
   #define AppGuid "{{FEEDFACE-0000-4000-8000-00000000E2E1}"
   #define OutputName "E2E-TEST-Setup-" + AppVersion
+  #define RunValue "StockTrackerE2ETest"
 #else
   #define AppName "Stock Tracker"
   ; Keep this GUID fixed forever: it is how Windows recognises upgrades of the same app.
   #define AppGuid "{{09AC96D6-3F59-4D47-BCE8-143E43C6101A}"
   #define OutputName "StockTracker-Setup-" + AppVersion
+  #define RunValue "StockTracker"
 #endif
 
 [Setup]
@@ -43,6 +45,11 @@ RestartApplications=no
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+; Off by default. The app's Settings window shows and changes the same setting.
+Name: "startup"; Description: "Start Stock Tracker in the background when I sign in to Windows"; GroupDescription: "Startup:"; Flags: unchecked
+
+[Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#RunValue}";   ValueData: """{app}\{#AppExe}"" --background"; Tasks: startup; Flags: uninsdeletevalue
 
 [Files]
 Source: "..\dist\StockTracker\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
@@ -57,6 +64,41 @@ Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait pos
 Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RelaunchRequested
 
 [Code]
+// The app keeps running in the tray after its window is closed, so it has to be asked to exit
+// before its files can be replaced or removed. It listens for this named event (see
+// src\single_instance.py). Older versions don't create it: OpenEvent then returns 0 and nothing happens.
+function OpenEventW(dwDesiredAccess: Cardinal; bInheritHandle: Boolean; lpName: String): THandle;
+  external 'OpenEventW@kernel32.dll stdcall';
+function SetEvent(hEvent: THandle): Boolean;
+  external 'SetEvent@kernel32.dll stdcall';
+function CloseHandle(hObject: THandle): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+procedure AskRunningAppToQuit;
+var
+  Event: THandle;
+begin
+  Event := OpenEventW($0002, False, 'Local\StockTrackerSystem.Quit');   // EVENT_MODIFY_STATE
+  if Event <> 0 then
+  begin
+    SetEvent(Event);
+    CloseHandle(Event);
+    Sleep(2000);
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  AskRunningAppToQuit;
+  Result := '';
+end;
+
+function InitializeUninstall: Boolean;
+begin
+  AskRunningAppToQuit;
+  Result := True;
+end;
+
 // True when the installer was started by the in-app updater (/RELAUNCH=1).
 function RelaunchRequested: Boolean;
 begin
@@ -69,11 +111,14 @@ end;
 // uninstall (scripts, tests, IT tools) never asks and never deletes anything: a plain MsgBox
 // is NOT suppressed by /SUPPRESSMSGBOXES, so without this guard a stray click could wipe data.
 // Test builds compile the deletion out entirely.
-#ifndef TestBuild
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: String;
 begin
+  // The app can add its own start-with-Windows entry from Settings; never leave it pointing at a deleted file.
+  if CurUninstallStep = usPostUninstall then
+    RegDeleteValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#RunValue}');
+#ifndef TestBuild
   if (CurUninstallStep = usPostUninstall) and (not UninstallSilent) then
   begin
     DataDir := ExpandConstant('{localappdata}\StockTracker');
@@ -84,5 +129,5 @@ begin
                 mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
         DelTree(DataDir, True, True, True);
   end;
-end;
 #endif
+end;

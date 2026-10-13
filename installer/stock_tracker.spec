@@ -12,7 +12,7 @@ datas = [(os.path.join(SPECPATH, "app.ico"), ".")]
 binaries = []
 # The app imports these dynamically (importlib.import_module), which PyInstaller
 # can't see, so they are listed explicitly.
-hiddenimports = ["qrcode", "qrcode.image.pil", "PIL.Image", "PIL.ImageTk", "PIL._tkinter_finder"]
+hiddenimports = ["qrcode", "qrcode.image.pil", "PIL.Image", "PIL.ImageTk", "PIL._tkinter_finder", "pystray._win32"]
 
 # Firebase / Firestore / gRPC ship data files and lazily loaded submodules.
 for package in ("firebase_admin", "google.cloud.firestore", "google.cloud.firestore_v1", "grpc", "reportlab"):

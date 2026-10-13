@@ -116,6 +116,9 @@ def _work_area(window):
     return 0, 0, window.winfo_screenwidth(), max(240, window.winfo_screenheight() - 48)
 
 
+work_area = _work_area
+
+
 def fit_window(window, width, height, parent=None, min_width=None, min_height=None):
     """Sizes a window to width x height, but never larger than the screen can show (the taskbar and
     the window's own title bar are allowed for), and places it centred over `parent` (or the screen)
@@ -287,6 +290,14 @@ class ThemeManager:
                         font=(UI_FONT, 9, "bold"), relief="flat", borderwidth=0, padding=(10, 9))
         style.map("Treeview.Heading", background=[("active", p["border"])])
         style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "white")])
+        style.configure("TNotebook", background=p["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+        # The selected tab is larger (bigger text and padding) and the others smaller
+        style.configure("TNotebook.Tab", background=p["subtle"], foreground=p["muted"],
+                        font=(UI_FONT, 9, "bold"), padding=(12, 5), borderwidth=0)
+        style.map("TNotebook.Tab",
+                  background=[("selected", p["surface"])], foreground=[("selected", p["text"])],
+                  font=[("selected", (UI_FONT, 10, "bold"))],
+                  padding=[("selected", (18, 8))])
         style.configure("TScrollbar", background=p["thumb"], troughcolor=p["bg"], bordercolor=p["bg"],
                         lightcolor=p["thumb"], darkcolor=p["thumb"], arrowcolor=p["muted"],
                         relief="flat", borderwidth=0, arrowsize=14)
